@@ -1,0 +1,29 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug DeepSpeed",
+            "type": "python",
+            "request": "launch",
+            "program": "/research/d1/rshr/ytyang/PYTHONUSER/python/bin/deepspeed",
+            "justMyCode": true,
+            "console": "integratedTerminal",
+            "args": [
+                "--num_nodes=1",
+                "--num_gpus=2",
+                "/research/d1/rshr/ytyang/DeepSpeedExamples/cifar/cifar10_deepspeed.py",
+                "--deepspeed",
+                "--deepspeed_config ds_config.json",
+                "--moe",
+                "--ep-world-size 2",
+                "--num-experts 2",
+                "--top-k 1",
+                "--noisy-gate-policy 'RSample'",
+                "--moe-param-group"
+            ]
+        }
+    ]
+}
