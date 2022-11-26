@@ -70,6 +70,8 @@ class CommsLogger:
             self.debug = comms_config.comms_logger.debug
             self.prof_ops = comms_config.comms_logger.prof_ops
             self.prof_all = comms_config.comms_logger.prof_all
+            print("enabled time logging!!")
+
 
     # There are three settings for the op profiler:
     # - Global profiling (profile all comms)

@@ -2,6 +2,7 @@
 Copyright 2020 The Microsoft DeepSpeed Team
 '''
 
+from deepspeed.utils import logger
 import torch
 import copy
 
@@ -22,7 +23,9 @@ class Experts(torch.nn.Module):
                 param.group_name = expert_group_name
 
     def forward(self, inputs):
+        # logger.debug("experts_inputs.shape({})".format(inputs.shape))
         chunks = inputs.chunk(self.num_local_experts, dim=1)
+        # logger.debug("length_chunks:{} experts_chunks.shape({})".format(len(chunks), chunks[0].shape))
         expert_outputs = []
         for chunk, expert in zip(chunks, self.deepspeed_experts): # 在all2all之后，第i个chunk中的内容，由第i个expert计算
             out = expert(chunk)

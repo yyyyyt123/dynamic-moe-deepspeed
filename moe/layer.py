@@ -27,7 +27,8 @@ class MoE(torch.nn.Module):
                  drop_tokens: bool = True,
                  use_rts=True,
                  use_tutel: bool = False,
-                 enable_expert_tensor_parallelism: bool = False):
+                 enable_expert_tensor_parallelism: bool = False,
+                 dyna_threshold: float = 0.015):
         """Initialize an MoE layer.
 
         Arguments:
@@ -73,7 +74,8 @@ class MoE(torch.nn.Module):
                                                min_capacity,
                                                noisy_gate_policy,
                                                drop_tokens,
-                                               use_rts),
+                                               use_rts,
+                                               dyna_threshold),
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,

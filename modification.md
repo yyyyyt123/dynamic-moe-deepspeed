@@ -1,0 +1,2 @@
+[x] distributesampler: disable shuffle
+[ ]

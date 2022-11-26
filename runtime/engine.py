@@ -1728,6 +1728,7 @@ class DeepSpeedEngine(Module):
         # TODO: Allreduce/average them across ranks for more accurate timing.
 
         # if deepspeed.comm.get_rank() == 0:
+        # TODO: fix moe_layer printing
         log_dist(
             f"rank={dist.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
             ranks=[0])
@@ -2064,6 +2065,7 @@ class DeepSpeedEngine(Module):
                 if self.monitor.enabled:
                     self._write_monitor()
 
+                # TODO:properly show timing log ?
                 if self.has_moe_layers:
                     fwd_time = self.timers(FORWARD_GLOBAL_TIMER).elapsed(reset=False)
                     self.print_forward_breakdown(fwd_time=fwd_time)

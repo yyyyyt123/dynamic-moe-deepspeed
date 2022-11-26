@@ -4,3 +4,6 @@ class DeepSpeedOptimizer(object):
 
 class ZeROOptimizer(DeepSpeedOptimizer):
     pass
+
+class DeepSpeedConfig(object):
+    pass

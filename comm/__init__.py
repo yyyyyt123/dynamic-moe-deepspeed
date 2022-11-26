@@ -45,3 +45,4 @@ if older_torch():
 else:
     supported_torch_version = True
     from .comm import *
+    from .config import *

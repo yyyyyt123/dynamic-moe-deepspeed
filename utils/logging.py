@@ -41,7 +41,7 @@ class LoggerFactory:
         return logger_
 
 
-logger = LoggerFactory.create_logger(name="DeepSpeed", level=logging.INFO)
+logger = LoggerFactory.create_logger(name="DeepSpeed", level=logging.DEBUG)
 
 
 def log_dist(message, ranks=None, level=logging.INFO):
