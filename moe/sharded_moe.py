@@ -433,7 +433,7 @@ def top2gating(logits: Tensor,
 def dynamicgating(logits: Tensor,
                capacity_factor: float,
                min_capacity: int,
-               threshold: float) -> Tuple[Tensor,
+               threshold) -> Tuple[Tensor,
                                            Tensor,
                                            Tensor,
                                            Tensor]:
@@ -470,7 +470,7 @@ def dynamicgating(logits: Tensor,
     top1_selectednum = dynamic_mask.sum()
     top2_selectednum = logits.size(0) - top1_selectednum
     mask2 = mask2.masked_fill(dynamic_mask, False) # remask the dispatch tokens
-    mean_threshold = torch.mean(top1_val - top2_val)
+    mean_threshold = torch.mean(top1_val - top2_val).detach()
     
     # logger.debug("top1_val:{}".format(top1_val))
     # logger.debug("top2_val:{}".format(top2_val))
@@ -538,7 +538,7 @@ def dynamicgating(logits: Tensor,
     dispatch_mask = combine_weights.bool()
     # logger.debug("dispatch_mask:{}".format(dispatch_mask)) # 8,4,4
 
-    return l_aux, combine_weights, dispatch_mask, (exp_counts, top1_selectednum, top2_selectednum)
+    return l_aux, combine_weights, dispatch_mask, (exp_counts, top1_selectednum, top2_selectednum), mean_threshold
 
 class TopKGate(Module):
     """Gate module which implements Top2Gating as described in Gshard_.
@@ -568,7 +568,7 @@ class TopKGate(Module):
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
                  use_rts: bool = True,
-                 dyna_threshold: float = 0.015) -> None:
+                 dyna_threshold: float = 0.075) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
@@ -585,7 +585,7 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
-        self.dyna_threshold = dyna_threshold
+        self.dyna_threshold = torch.nn.Parameter(torch.Tensor([dyna_threshold]), requires_grad = False) # for model restore
 
     def forward(
             self,
@@ -629,6 +629,8 @@ class TopKGate(Module):
                 self.min_capacity,
                 threshold=self.dyna_threshold
                 )
+            self.dyna_threshold[0] = 0.95 * self.dyna_threshold + 0.04 * gate_output[4]
+            gate_output = gate_output[0:4]
             
 
         if self.wall_clock_breakdown:
