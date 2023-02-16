@@ -39,13 +39,10 @@
 - [ ] Reach specified steps2: exchange experts parameters
 
 ### Phase2
-- [ ] All_to_All: use the method in fastmoe, exchange buffer size before real data 
+- [x] All_to_All: use the method in fastmoe, exchange buffer size before real data 
 
 
 
-### misc
-+ `expert_parallel_size_`: 所有不同的experts（不考虑数据并行）占据了多少个GPUs
-+ `expert_parallel_group`: 专家并行占据的group，groups=[0,1,2,3]所有专家分布在GPU0-4上。而groups=[0],[1],[2],[3]每个GPU上都有所有的专家
 
 ## Plan
 ### Data Structure & Steps
@@ -61,15 +58,23 @@
    + 确定发送与接受的数据量大小 (需要合并发送数据量&标记数组清零)
    + 使用pytorch中`all2all_single_unequal_split`，发送all2all
 4. locally compute
-5. add all_reduce at end of each backward
+1. add all_reduce at end of each backward
    + possible solution: pytorch hook?
-6. 达到特定轮次后，开启gurobi优化
+2. 达到特定轮次后，开启gurobi优化
    + change experts placement
    + change globalPostion array
 
 ### Preliminary
-- [ ] How to use unequal split all2all communication?
+- [x] How to use unequal split all2all communication?
 - [x] How to exchange globalPostion
-- [ ] How to exchange experts parameters
+- [x] How to exchange experts parameters
+- [x] Can these all_reduce/broadcast operation be executed in parallel?
 - [ ] How to use pytorch hook to add multiple all_reduce?
-- [ ] Can these all_reduce operation be executed asynchronously?
+- [ ] Read zero optimization in deepspeed
+
+
+### misc
++ `expert_parallel_size_`: 所有不同的experts（不考虑数据并行）占据了多少个GPUs
++ `expert_parallel_group`: 专家并行占据的group，groups=[0,1,2,3]所有专家分布在GPU0-4上。而groups=[0],[1],[2],[3]每个GPU上都有所有的专家
++ 使用`all_to_all_single`:使用all_to_all_single可以附加split_size相关参数，从而实现all_to_all发送数据量大小不均衡的情况
+  + 发送数据的类型必须要提前确定
