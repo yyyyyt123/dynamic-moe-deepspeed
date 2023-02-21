@@ -992,7 +992,12 @@ class DeepSpeedEngine(Module):
             # Broadcast the model for different parameters
             if is_moe_param(p):
                 if torch.is_tensor(p) and is_replicated(p):
-                    dist.broadcast(p,
+                    if p.group_name[:4]=='layer':
+                        dist.broadcast(p,
+                                   groups._get_dynamic_expert_broadcast_src_rank(p.group_name),
+                                   group=self.dynamic_expert_parallel_group[p.group_name])
+                    else:
+                        dist.broadcast(p,
                                    groups._get_expert_broadcast_src_rank(p.group_name),
                                    group=self.expert_data_parallel_group[p.group_name])
             else:
@@ -1084,6 +1089,7 @@ class DeepSpeedEngine(Module):
         self.mp_world_size = groups._get_model_parallel_world_size()
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
+        self.dynamic_expert_parallel_group = groups._get_dynamic_expert_parallel_group_dict()
 
         if not self.amp_enabled():
             self._broadcast_model()

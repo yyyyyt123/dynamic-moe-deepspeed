@@ -771,9 +771,9 @@ class MOELayer(Base):
             # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
             # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
             
-
+        # logger.debug(f"Before all2all dispatched_input.shape({dispatched_input.shape}) data:{dispatched_input}") # 2, 4, 84
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
-        # logger.debug("After all2all dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+        # logger.debug(f"After all2all dispatched_input.shape({dispatched_input.shape}) data:{dispatched_input}") # 2, 4, 84
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').stop()
@@ -830,5 +830,204 @@ class MOELayer(Base):
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
-        # exit(0)
+        exit(0)
         return a
+
+
+class DynamicMOELayer(Base):
+    """MOELayer module which implements MixtureOfExperts as described in Gshard_.
+    ::
+
+        gate = TopKGate(model_dim, num_experts)
+        moe = MOELayer(gate, expert)
+        output = moe(input)
+        l_aux = moe.l_aux
+
+    .. Gshard_: https://arxiv.org/pdf/2006.16668.pdf
+
+    Args:
+        gate (torch.nn.Module):
+            gate network
+        expert (torch.nn.Module):
+            expert network
+    """
+    def __init__(self,
+                 gate: Module,
+                 experts: Module,
+                 ep_group_name,
+                 ep_size,
+                 num_local_experts: int,
+                 num_exp_replica: int,
+                 current_experts,
+                 use_tutel: bool = False) -> None:
+        super().__init__()
+        self.gate = gate
+        self.experts = experts
+        self.ep_group = None
+        self.ep_size = ep_size
+        self.ep_group_name = ep_group_name
+        self.num_local_experts = num_local_experts
+        self.num_exp_replica = num_exp_replica
+        self.current_experts = current_experts
+        self.time_falltoall = 0.0
+        self.time_salltoall = 0.0
+        self.time_moe = 0.0
+        self.timers = SynchronizedWallClockTimer()
+        self.wall_clock_breakdown = False
+
+        self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
+
+        if self.use_tutel:
+            logger.info('Using Tutel optimizations.')
+        elif use_tutel and not TUTEL_INSTALLED:
+            logger.warning("Tutel optimization requested but not installed. "
+                           "Proceeding without Tutel.")
+        elif use_tutel and TUTEL_INSTALLED and gate.k != 1:
+            logger.warning(
+                "To enable Tutel optimization, use top-1 instead of top-2 gate. "
+                "Proceeding without Tutel.")
+
+    def _set_ep_group(self, ep_group):
+        self.ep_group = ep_group
+
+    def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+
+        if self.wall_clock_breakdown:
+            self.timers('moe').start()
+
+        # Implement Algorithm 2 from GShard paper.
+        d_model = input[0].shape[-1]
+        # logger.debug("d_model:{}".format(d_model)) # 8
+
+        # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
+        # Reshape into G groups so that each group can distribute tokens equally
+        # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
+        reshaped_input = input[0].reshape(-1, d_model)
+        # logger.debug("input.shape({})".format(input[0].shape)) # 8, 84
+
+        if self.use_tutel:
+            self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
+            S, M = reshaped_input.size(0), reshaped_input.size(1)
+
+            if not hasattr(self, '_tutel_dispatcher'):
+                self._tutel_dispatcher = tutel_moe.fast_dispatcher(
+                    E,
+                    C,
+                    M,
+                    dispatch_dtype=reshaped_input.dtype)
+            self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
+            dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
+        else:
+            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            # 通过top1 gate之后生成的一个dispatch_mask的具体形式是(num of tokens, num of experts, capacity)
+            # 其中num of experts, capacity中，第n行代表分配给第n个expert的token情况，第n列代表当前token是capacity的第几个
+            # 例如dispatch_mask为(8,2,4)的情形时：
+            # [[False, False, False, False],    第一个token 不分配给expert1
+            #  [ True, False, False, False]],                分配给expert2，占用其第一个capacity 1/4
+            
+            # [[ True, False, False, False],    第二个token 分配给expert 1，占用其第一个capacity 1/4
+            #  [False, False, False, False]],               不分配给expert 2
+
+            # [[False, False, False, False],    第三个token  
+            #  [False,  True, False, False]],               分配给expert2，占用其第二个capacity 2/4
+    
+            # [[False,  True, False, False],    第三个token  分配给expert1，占用其第二个capacity 2/4
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False,  True, False]],
+    
+            # [[False, False,  True, False],
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False, False,  True]],
+    
+            # [[False, False, False,  True],
+            #  [False, False, False, False]]
+            logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
+            dispatched_input = einsum("sec,sm->ecm",
+                                      dispatch_mask.type_as(input[0]),
+                                      reshaped_input)  # 8, 84
+            # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
+            # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
+            # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
+            # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+
+
+        if self.wall_clock_breakdown:
+            self.timers('falltoall').start()
+
+        if groups._get_expert_model_parallel_world_size() == 1:
+            # If the non-expert is tensor-parallel, it will create
+            # duplicate tokens on the tensor-parallel ranks.
+            # Since our experts are not tensor-parallel, these duplicates
+            # need to be dropped to ensure correctness.
+            # this also doubles up as a communication optimization as we are
+            # reducing the all-to-all communication volume.
+            dispatched_input = drop_tokens(dispatched_input, dim=1)
+            # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
+            # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+            
+
+        dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        # logger.debug("After all2all dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+
+        if self.wall_clock_breakdown:
+            self.timers('falltoall').stop()
+            self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
+
+        # Re-shape after all-to-all: ecm -> gecm
+        # logger.debug("ep_size:{} num_local_experts:{}".format(self.ep_size, self.num_local_experts)) # 
+        
+        dispatched_input = dispatched_input.reshape(self.ep_size,
+                                                    self.num_local_experts - self.num_exp_replica,
+                                                    -1,
+                                                    d_model)
+        # logger.debug("after reshape dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 1, 4, 84
+
+        expert_output = self.experts(dispatched_input)
+
+        if self.wall_clock_breakdown:
+            self.timers('salltoall').start()
+
+        expert_output = _AllToAll.apply(self.ep_group, expert_output)
+
+        if self.wall_clock_breakdown:
+            self.timers('salltoall').stop()
+            self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
+
+        # Re-shape back: gecm -> ecm
+        expert_output = expert_output.reshape(self.ep_size * self.num_local_experts,
+                                              -1,
+                                              d_model)
+
+        if groups._get_expert_model_parallel_world_size() == 1:
+            # the dropped duplicate tokens need to be gathered on each
+            # tensor parallel rank again for the tensor-parallel
+            # non-expert of the next layer.
+            expert_output = gather_tokens(expert_output, dim=1)
+
+        # logger.debug("expert_ouput.shape({}), expert_output:{}".format(expert_output.shape, expert_output))
+        # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
+        # enisum: (8, 2, 4), (2, 4, 84) -> (8, 84)
+        # combine_weights是sparse的，在(2,4)中，只有一个元素非0，其他都是false
+        # einsum计算的结果为当前rank的tokens在expert计算结果 * 相应weight
+        if self.use_tutel:
+            combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
+        else:
+            combined_output = einsum("sec,ecm->sm",
+                                     combine_weights.type_as(input[0]),
+                                     expert_output)
+
+        # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
+        a = combined_output.reshape(input[0].shape)
+        # logger.debug("a.shape({}), a:{}".format(a.shape, a))
+
+        if self.wall_clock_breakdown:
+            self.timers('moe').stop()
+            self.time_moe = self.timers('moe').elapsed(reset=False)
+
+        exit(0)
+        return a
+
