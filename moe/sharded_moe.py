@@ -13,7 +13,7 @@ Copyright 2021 The Microsoft DeepSpeed Team
 # LICENSE file in the root directory of this source tree.
 
 from deepspeed.utils.timer import SynchronizedWallClockTimer
-from deepspeed.utils import logger
+from deepspeed.utils import logger, topology
 from typing import Callable, Dict, TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
@@ -859,6 +859,7 @@ class DynamicMOELayer(Base):
                  num_local_experts: int,
                  num_exp_replica: int,
                  current_experts,
+                 current_intra_node_placement,
                  use_tutel: bool = False) -> None:
         super().__init__()
         self.gate = gate
@@ -868,12 +869,13 @@ class DynamicMOELayer(Base):
         self.ep_group_name = ep_group_name
         self.num_local_experts = num_local_experts
         self.num_exp_replica = num_exp_replica
-        self.current_experts = current_experts
+        self.current_experts = current_experts # current experts indices
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
+        self.current_intra_node_placement=current_intra_node_placement # current intra-node placement info
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -946,7 +948,7 @@ class DynamicMOELayer(Base):
             # [[False, False, False,  True],
             #  [False, False, False, False]]
             logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
-            dispatched_input = einsum("sec,sm->ecm",
+            dispatched_input = einsum("sec,sm->ecm", # (num of experts, capacity, dimension)
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)  # 8, 84
             # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
@@ -954,6 +956,15 @@ class DynamicMOELayer(Base):
             # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
             # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
 
+            chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
+            w = [u.squeeze() for u in chunks]
+            for i, send in enumerate(self.exp_counts):
+                w[i] = w[i][0:self.exp_counts[i]]
+            
+            print(w[0].shape)
+            print(w[1].shape)
+            print(w[2].shape)
+            print(w[3].shape)
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()

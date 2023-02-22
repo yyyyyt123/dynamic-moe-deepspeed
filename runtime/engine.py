@@ -56,6 +56,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
+from deepspeed.utils import topology
 from deepspeed.utils import logger, log_dist, instrument_w_nvtx
 from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
@@ -374,6 +375,8 @@ class DeepSpeedEngine(Module):
         util_ops = UtilsBuilder().load()
         self.flatten = util_ops.flatten
         self.unflatten = util_ops.unflatten
+        
+
 
     def destroy(self):
         if self.optimizer is not None and hasattr(self.optimizer, 'destroy'):
@@ -992,7 +995,7 @@ class DeepSpeedEngine(Module):
             # Broadcast the model for different parameters
             if is_moe_param(p):
                 if torch.is_tensor(p) and is_replicated(p):
-                    if p.group_name[:4]=='layer':
+                    if p.group_name[:5]=='layer':
                         dist.broadcast(p,
                                    groups._get_dynamic_expert_broadcast_src_rank(p.group_name),
                                    group=self.dynamic_expert_parallel_group[p.group_name])

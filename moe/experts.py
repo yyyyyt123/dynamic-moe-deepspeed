@@ -45,10 +45,8 @@ class DynamicExperts(torch.nn.Module):
             [copy.deepcopy(expert) for i in range(num_local_experts)])
         self.num_local_experts = num_local_experts
 
-        # TODO: revisit allreduce for moe.gate...
         for i, expert in enumerate(self.deepspeed_experts):
             
-            # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
             for name, param in expert.named_parameters():
                 param.allreduce = False
                 param.group_name = curr_name[i]

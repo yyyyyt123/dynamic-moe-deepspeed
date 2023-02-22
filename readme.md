@@ -97,13 +97,29 @@
 1. 宏定义: _LOCAL_EXPNUM=2, _EXPERT_DATA_PARALLEL_GROUP: 存放当前GPU上experts信息
 
 2. 每个expert存在于哪几张GPU上：
-   `_GLOBAL_POS`=torch.tensor([[0,3],[1,2],[1,2],[0,3]]) 表示GPU0上存在exp0&3
-   + 每个rank遍历`_GLOBAL_POS`的同时，创建processgroup
+   `_placement`=torch.tensor([[0,3],[1,2],[1,2],[0,3]]) 表示GPU0上存在exp0&3
+   + 每个rank遍历`_placement`的同时，创建processgroup
 
 3. 存放当前GPU上experts信息
    + `_EXPERT_DATA_PARALLEL_GROUP` = {`KEY`, `VALUE`}
      + KEY: `_EXPERT_NAME`      : 当前保存的experts名称 (group name) 例如"layer_1_expert_13"
      + VALUE: `_PROCESS_GROUP`  ：process_group信息
-  
+
+### All_to_All 
+1. 每个intra-node内先做num_local_experts轮的all_to_all communication，交换intra-node内数据信息
+    + 使用dist.new_subgroups()创建all_to_all的通信group
+    + 注意出现一个node内存在同一个expert的副本的情况
+2. 使用unequal all_to_all的forward & backward 需要修改
+   + ctx中需要保input_split与output_split,用于backward计算
+3. dispatched_input: shape(num of experts, capacity, dimension)
+   + 先将数据分到list中
+   + 判断是否存在全0token的情况 -> dimension=1求和是否为0
+   + 去除尾部的tokens
+   + 标记capacity？ / 或许可以直接根据dispatch情况对dispatched_input的list做分割？
+4. weight
+   + 计算weight之前，需要将数据padding打包，之后用于einsum求和
+   
 ### Details
-- [ ] init & all2all-unequal & allreduce_backward
+- [x] init 
+- [ ] all2all-unequal 
+- [ ] allreduce_backward

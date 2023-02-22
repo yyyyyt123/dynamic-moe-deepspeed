@@ -184,6 +184,10 @@ def new_group(ranks):
     assert cdb is not None and cdb.is_initialized(), 'DeepSpeed backend not set, please initialize it using init_process_group()'
     return cdb.new_group(ranks)
 
+def new_subgroups():
+    global cdb
+    assert cdb is not None and cdb.is_initialized(), 'DeepSpeed backend not set, please initialize it using init_process_group()'
+    return cdb.new_subgroups()
 
 def is_available() -> bool:
 

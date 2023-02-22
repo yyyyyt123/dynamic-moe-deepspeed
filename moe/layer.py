@@ -8,7 +8,7 @@ import numpy as np
 import torch.distributed as dist
 from deepspeed.utils import log_dist
 
-from deepspeed.utils import groups
+from deepspeed.utils import groups, topology
 from .sharded_moe import MOELayer, TopKGate, DynamicMOELayer
 from .experts import Experts, DynamicExperts
 import typing
@@ -136,34 +136,7 @@ class MoE(torch.nn.Module):
             output = output * coef[..., 0:1] + output_mlp * coef[..., 1:]
         return output, self.deepspeed_moe.l_aux, self.deepspeed_moe.exp_counts
 
-# def GenerateInitPlacment(local_total_exps, num_exp_replica, world, num_exps):
-#     '''
-#     local_total_exps: 每张GPU上一层内总计存放experts数目
-#     num_exp_replica: 可以存放副本数量
-#     world: world size
-#     num_exps:总共experts数目
-#     '''
-#     l=[]
-#     num=0
-#     local_exp_num = local_total_exps - num_exp_replica # 每个GPU上独立的Expert个数
-#     for i in range(world):
-#         w=[]
-#         # 先对每个GPU独立的Experts进行编号
-#         for i in range(local_exp_num):
-#             w.append(num)
-#             num += 1
-        
-#         # 为replica随机生成random序号
-#         for i in range(num_exp_replica):
-#             o = np.random.randint(num_exps)
-#             while o in w:
-#                 o = np.random.randint(num_exps)
-#             w.append(o)
-            
-#         w = sorted(w)
-#         l.append(w)
-    
-#     return torch.tensor(l)
+
     
         
 class DynamicMoE(torch.nn.Module):
@@ -205,6 +178,8 @@ class DynamicMoE(torch.nn.Module):
         """
 
         super(DynamicMoE, self).__init__()
+        topology._set_total_gpu_number() # TODO: MOVE TO AN APPROPRIATE PLACE
+        topology._set_gpu_per_node_number(2)
         rank = dist.get_rank()
 
         self.use_residual = use_residual
@@ -214,18 +189,24 @@ class DynamicMoE(torch.nn.Module):
         self.layer_idx = layer_idx
         self.num_exp_replica = num_exp_replica # 每个GPU每层可以保存的副本数
         self.num_local_experts = num_experts // self.ep_size + self.num_exp_replica # 每个gpu上local_experts个数 + 副本存在个数
+        self.intra_node_gpus=topology._get_gpu_per_node_number()
+        
         # expert placement on gpus 
         # example: placement->[[0,3],[1,2],[1,2],[0,3]] indicates gpu0 contains exp1&3
         self.placement = groups._generate_init_placment(local_total_exps=self.num_local_experts, 
                                               num_exp_replica=self.num_exp_replica,
                                               num_exps=self.num_experts)
-        
+        # broadcast placement info
         dist.barrier() # can remove this 
         dist.broadcast(self.placement, src=0)
         # get current GPU placement info
         self.current_experts = self.placement[rank] # current experts indices
         self.current_experts_name = [f"layer_{self.layer_idx}_expert_{i}" for i in self.current_experts] # current experts name
         self.current_experts_replica_idx = self._get_replica_experts_idx(rank) # indices for replica experts
+        # get current intra-node placement info
+        sub_groups_start = (rank // self.intra_node_gpus) * self.intra_node_gpus
+        sub_groups_end = sub_groups_start + self.intra_node_gpus
+        self.current_intra_node_placement = self.placement[sub_groups_start:sub_groups_end].tolist()
         
         print(f"rank:{rank}'s placement is {self.placement}")
         
@@ -254,6 +235,7 @@ class DynamicMoE(torch.nn.Module):
                                       self.num_local_experts,
                                       self.num_exp_replica,
                                       self.current_experts,
+                                      self.current_intra_node_placement,
                                       use_tutel=use_tutel)
         if self.use_residual:
             self.mlp = expert
@@ -262,6 +244,7 @@ class DynamicMoE(torch.nn.Module):
 
     def set_deepspeed_parallelism(self):
         self._create_process_groups()
+        self._create_all_to_all_process_group()
 
     def _create_process_groups(self):
         rank = dist.get_rank()
@@ -273,6 +256,9 @@ class DynamicMoE(torch.nn.Module):
                 groups._create_dynamic_expert_parallel(self.placement, self.layer_idx, self.num_experts)
             
         # print(f"rank_{rank}, process dict is:{groups._get_dynamic_expert_parallel_group_dict().keys()}")
+    
+    def _create_all_to_all_process_group(self):
+        groups._create_dynamic_expert_all_to_all_group()
 
     def _get_replica_experts_idx(self, rank):
         """get the indices of replica of experts 

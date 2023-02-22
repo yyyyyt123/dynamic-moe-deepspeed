@@ -25,8 +25,7 @@ Copyright 2021 The Microsoft DeepSpeed Team
 """
 
 from deepspeed import comm as dist
-
-from deepspeed.utils import log_dist
+from deepspeed.utils import log_dist, topology
 from deepspeed.utils.exceptions import DeprecatedException
 
 import torch
@@ -40,6 +39,8 @@ _EXPERT_DATA_PARALLEL_GROUP = {}
 _DYNAMIC_EXPERTS_PARALLEL_GROUP = {}
 # dynamic expert parallel group (world)
 _DYNAMIC_EXPERTS_PROCESS_GROUPS_DICT = {}
+# dynamic expert all-to-all process group that the current rank belongs to
+_DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP={}
 # dist world group needs to be cloned for some cases
 _WORLD_GROUP = None
 # global object to maintain mpu object if passed by a Megatron client
@@ -118,16 +119,24 @@ def _generate_init_placment(local_total_exps, num_exp_replica, num_exps):
     num_exp_replica: 可以存放副本数量
     num_exps:总共experts数目
     '''
-    # pytorch dist info
+    # get dist in info
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world_size = topology._get_total_gpu_number()
+    gpus_per_node=topology._get_gpu_per_node_number()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
-
+    # calc local expert number
+    local_exp_num = local_total_exps - num_exp_replica # 每个GPU上独立的Expert个数
+    ''' check args sanity'''
+    assert local_total_exps > num_exp_replica
+    assert world_size % gpus_per_node == 0
+    assert num_exps >= world_size
+    assert local_exp_num * world_size == num_exps
     l=[]
     num=0
-    local_exp_num = local_total_exps - num_exp_replica # 每个GPU上独立的Expert个数
-    for i in range(world_size):
+    nodes=torch.arange(num_exps).reshape(world_size // gpus_per_node, -1).tolist()
+    
+    for j in range(world_size):
         w=[]
         # 先对每个GPU独立的Experts进行编号
         for i in range(local_exp_num):
@@ -137,10 +146,12 @@ def _generate_init_placment(local_total_exps, num_exp_replica, num_exps):
         # 为replica随机生成random序号
         for i in range(num_exp_replica):
             o = np.random.randint(num_exps)
-            while o in w:
+            while (o in w) or (o in nodes[j // gpus_per_node]):
                 o = np.random.randint(num_exps)
             w.append(o)
+            nodes[j // gpus_per_node].append(o)
             
+        # print(f"node{j // gpus_per_node}: {nodes[j // gpus_per_node]}")
         w = sorted(w)
         l.append(w)
     
@@ -199,6 +210,43 @@ def _create_dynamic_expert_parallel(placement, layer_idx, num_experts):
                 f'creating dynamic expert parallel process group named {exp_name} with ranks: {comm_group_ranks}',
                 [rank])
 
+def _create_dynamic_expert_all_to_all_group():
+    group_size = torch.cuda.device_count()
+    world_size = dist.get_world_size()
+    if world_size < group_size:
+        raise ValueError("The arg 'group_size' must not exceed the world size")
+    if world_size % group_size != 0:
+        raise ValueError("The world size must be divisible by 'group_size'")
+
+    subgroups = []
+    cur_subgroup = None
+
+    for subgroup_id in range(world_size // group_size):
+        start_rank = subgroup_id * group_size
+        end_rank = start_rank + group_size
+        ranks_in_subgroup = list(range(start_rank, end_rank))
+        subgroup = dist.new_group(
+            ranks=ranks_in_subgroup
+        )
+        subgroups.append(subgroup)
+
+        rank = dist.get_rank()
+        if rank in ranks_in_subgroup:
+            cur_subgroup = subgroup
+            log_dist(
+                "Rank {} is assigned to subgroup {}".format(rank, ranks_in_subgroup),[rank]
+            )
+
+    # return cur_subgroup, subgroups
+
+    global _DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP
+    
+    if len(_DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP) == 0:
+        _DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP["current_intra_comm_group"]=cur_subgroup
+    else:
+        return
+
+    
 def _create_expert_and_data_parallel(expert_parallel_size_):
     """
         Create expert and data parallel groups.
@@ -384,9 +432,6 @@ def _get_expert_parallel_group(group_name):
     return _EXPERT_PARALLEL_GROUP[group_name]
 
 
-def _get_expert_parallel_group_dict():
-    """Get the expert parallel group dict."""
-    return _EXPERT_PARALLEL_GROUP
 
 
 def _get_expert_data_parallel_group(group_name):
@@ -400,6 +445,14 @@ def _get_dynamic_expert_parallel_group(group_name):
     assert group_name in _DYNAMIC_EXPERTS_PARALLEL_GROUP, \
         f'dynamic expert parallel group is not initialized or group_name:{group_name} not found in parallel group'
     return _DYNAMIC_EXPERTS_PARALLEL_GROUP[group_name]
+
+def _get_expert_parallel_group_dict():
+    """Get the expert parallel group dict."""
+    return _EXPERT_PARALLEL_GROUP
+
+def _get_dynamic_expert_all_to_all_group_dict():
+    """Get the expert parallel group dict."""
+    return _DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP
 
 def _get_expert_data_parallel_group_dict():
     """Get the expert data parallel group dict."""
