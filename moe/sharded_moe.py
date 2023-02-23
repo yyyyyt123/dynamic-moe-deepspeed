@@ -22,6 +22,11 @@ from torch.nn import Module
 import torch.nn.functional as F
 from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
+from deepspeed.ops.op_builder import UtilsBuilder
+
+util_ops = UtilsBuilder().load()
+flatten = util_ops.flatten
+unflatten = util_ops.unflatten
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -103,6 +108,35 @@ class _AllToAll(torch.autograd.Function):
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
         return (None, _AllToAll.apply(ctx.group, *grad_output))
 
+class _AllToAll_UNEQUAL(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx: Any,
+            group: torch.distributed.ProcessGroup,
+            input: Tensor,
+            input_split: list,
+            output_split: list) -> Tensor:  # type: ignore
+        ctx.group = group
+        ctx.input_split=input_split
+        ctx.output_split=output_split
+
+        input = input.contiguous()
+        output = torch.zeros(sum(output_split), device=input.device, dtype=input.dtype)
+        dist.all_to_all_single(output=output, tensor=input, output_split_sizes=output_split, 
+                               input_split_sizes=input_split, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
+        # print(f"grad_output[0].shape:{grad_output[0].shape}")
+        # print(f"input_split:{ctx.output_split}")
+        # print(f"output_split:{ctx.input_split}")
+        return (None,
+                _AllToAll_UNEQUAL.apply(ctx.group, grad_output[0], 
+                                              ctx.output_split, ctx.input_split),
+                None,
+                None)
+    
 
 # einsum rewrites are on par or more performant
 # switch can be bubbled up in future
@@ -444,7 +478,7 @@ def dynamicgating(logits: Tensor,
     capacity = _capacity(gates,
                          torch.tensor(capacity_factor * 2),
                          torch.tensor(min_capacity))
-
+    # print(f" current capacity is: {capacity}")
     # Create a mask for 1st's expert per token
     indices1_s = torch.argmax(gates, dim=1)
     num_experts = int(gates.shape[1])
@@ -486,7 +520,7 @@ def dynamicgating(logits: Tensor,
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
     # gating decisions
-    exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to('cpu')
+    exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to('cpu')  # 不受capacity限制的发送数目
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
@@ -893,7 +927,9 @@ class DynamicMOELayer(Base):
         self.ep_group = ep_group
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
-
+        
+        intra_comm_group = groups._get_dynamic_expert_all_to_all_group()
+        
         if self.wall_clock_breakdown:
             self.timers('moe').start()
 
@@ -947,7 +983,7 @@ class DynamicMOELayer(Base):
     
             # [[False, False, False,  True],
             #  [False, False, False, False]]
-            logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
+            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
             dispatched_input = einsum("sec,sm->ecm", # (num of experts, capacity, dimension)
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)  # 8, 84
@@ -956,15 +992,71 @@ class DynamicMOELayer(Base):
             # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
             # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
 
+            _current_capacity = dispatched_input.shape[1]
             chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
             w = [u.squeeze() for u in chunks]
-            for i, send in enumerate(self.exp_counts):
-                w[i] = w[i][0:self.exp_counts[i]]
+            curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
+            for i, send in enumerate(curr_exp_counts):
+                w[i] = w[i][0:curr_exp_counts[i]]
+                # if curr_exp_counts[i] == 0:
+                #     w[i] = w[i].reshape(0)
+
+            # print(curr_exp_counts)
+            # print(w)
+            # print(w[0].shape)
+            # print(w[1].shape)
+            # print(w[2].shape)
+            # print(w[3].shape)
             
-            print(w[0].shape)
-            print(w[1].shape)
-            print(w[2].shape)
-            print(w[3].shape)
+            # {num_local_experts} round all2all
+            recv_experts_outputs = []
+            for i in range(self.num_local_experts):
+                send_tokens_idx = []
+                for j in range(topology._get_gpu_per_node_number()):
+                    send_tokens_idx.append(self.current_intra_node_placement[j][i])
+                # print(f"in round{i} send tokens pos_idx:{send_tokens_idx}") 
+                
+                # first round: exchange size
+                token_send=[]
+                input_split=[]
+                for idx in send_tokens_idx:
+                    token_send.append(w[idx])
+                    input_split.append(w[idx].numel())
+                token_size2exchange=torch.tensor(input_split, device=token_send[0].device, dtype=torch.int32)
+                
+                # logger.debug(f"token_size2exchange:{token_size2exchange}")
+                
+                output_split = _AllToAll.apply(intra_comm_group, token_size2exchange).tolist()
+                
+                # logger.debug(f"output_split:{output_split}")
+
+                # second round: exchange data
+                flatten_send_tokens = flatten(token_send)
+                recv_expert_tokens = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_send_tokens,
+                                                       input_split, output_split)
+                curr_expert_tokens = recv_expert_tokens.reshape(-1, d_model)
+                # expert calculation
+                output = self.experts(curr_expert_tokens, i)
+                # print(f"output.shape: {output.shape}, output_split:{output_split}")
+                flatten_results = output.flatten()
+                # send results back
+                expert_outputs = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_results,
+                                                       output_split,input_split)
+                
+                # logger.debug(f"expert_outputs.shape: {expert_outputs.shape}, token_send[0].shape:{token_send[0].shape}, token_send[1].shape:{token_send[1].shape}")
+                
+                for _, sync in enumerate(unflatten(expert_outputs, token_send)):
+                    if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+                    sync = torch.nn.functional.pad(
+                        sync, 
+                        (0,0,0,_current_capacity-sync.shape[0]), 
+                        'constant', 
+                        0)
+                    assert sync.shape[0] == _current_capacity
+                    recv_experts_outputs.append(sync)
+                
+                #TODO: GLOBAL experts calc
+                
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
@@ -981,35 +1073,34 @@ class DynamicMOELayer(Base):
             # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
             
 
-        dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        # dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
         # logger.debug("After all2all dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').stop()
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
 
-        # Re-shape after all-to-all: ecm -> gecm
-        # logger.debug("ep_size:{} num_local_experts:{}".format(self.ep_size, self.num_local_experts)) # 
-        
-        dispatched_input = dispatched_input.reshape(self.ep_size,
-                                                    self.num_local_experts - self.num_exp_replica,
-                                                    -1,
-                                                    d_model)
-        # logger.debug("after reshape dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 1, 4, 84
+        # Re-shape after all-to-all: ecm -> gecm        
+        # dispatched_input = dispatched_input.reshape(self.ep_size,
+        #                                             self.num_local_experts - self.num_exp_replica,
+        #                                             -1,
+        #                                             d_model)
 
-        expert_output = self.experts(dispatched_input)
+        # expert_output = self.experts(dispatched_input)
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
-        expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        # expert_output = _AllToAll.apply(self.ep_group, expert_output)
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
             self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
 
-        # Re-shape back: gecm -> ecm
-        expert_output = expert_output.reshape(self.ep_size * self.num_local_experts,
+        # Re-shape back: gecm -> ecm        
+        expert_output = torch.cat(recv_experts_outputs, dim=0) # 横向拼接
+        # print(f"expert_output.shape:{expert_output.shape}")
+        expert_output = expert_output.reshape(self.ep_size * (self.num_local_experts - self.num_exp_replica),
                                               -1,
                                               d_model)
 
@@ -1039,6 +1130,6 @@ class DynamicMOELayer(Base):
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
-        exit(0)
+        # exit(0)
         return a
 

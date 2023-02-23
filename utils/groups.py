@@ -211,8 +211,8 @@ def _create_dynamic_expert_parallel(placement, layer_idx, num_experts):
                 [rank])
 
 def _create_dynamic_expert_all_to_all_group():
-    group_size = torch.cuda.device_count()
-    world_size = dist.get_world_size()
+    group_size = topology._get_gpu_per_node_number()
+    world_size = topology._get_total_gpu_number()
     if world_size < group_size:
         raise ValueError("The arg 'group_size' must not exceed the world size")
     if world_size % group_size != 0:
@@ -450,9 +450,9 @@ def _get_expert_parallel_group_dict():
     """Get the expert parallel group dict."""
     return _EXPERT_PARALLEL_GROUP
 
-def _get_dynamic_expert_all_to_all_group_dict():
+def _get_dynamic_expert_all_to_all_group():
     """Get the expert parallel group dict."""
-    return _DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP
+    return _DYNAMIC_EXPERTS_ALL_TO_ALL_GROUP["current_intra_comm_group"]
 
 def _get_expert_data_parallel_group_dict():
     """Get the expert data parallel group dict."""

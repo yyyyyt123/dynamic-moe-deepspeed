@@ -65,3 +65,14 @@ class DynamicExperts(torch.nn.Module):
 
         expert_output = torch.cat(expert_outputs, dim=1) # 横向拼接
         return expert_output
+
+    def forward(self, inputs, expert_calc_idx):
+        expert = self.deepspeed_experts[expert_calc_idx]
+        
+        out = expert(inputs)
+        if type(out) is tuple:
+            out = out[0]  # Ignore the bias term for now
+        # expert_outputs += [out]
+
+        # expert_output = torch.cat(expert_outputs, dim=1) # 横向拼接
+        return out
