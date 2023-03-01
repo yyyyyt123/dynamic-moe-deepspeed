@@ -120,20 +120,28 @@ class _AllToAll_UNEQUAL(torch.autograd.Function):
         ctx.input_split=input_split
         ctx.output_split=output_split
 
-        input = input.contiguous()
+        # input = input.contiguous()
         output = torch.zeros(sum(output_split), device=input.device, dtype=input.dtype)
+        
         dist.all_to_all_single(output=output, tensor=input, output_split_sizes=output_split, 
                                input_split_sizes=input_split, group=group)
+        
         return output
 
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
+        # print(f"len_grad_output):{len(grad_output)}")
+        
+        # print(f"rank:{dist.get_rank()}:before unequal all2all")
         # print(f"grad_output[0].shape:{grad_output[0].shape}")
         # print(f"input_split:{ctx.output_split}")
         # print(f"output_split:{ctx.input_split}")
+        result = _AllToAll_UNEQUAL.apply(ctx.group, grad_output[0], 
+                                              ctx.output_split, ctx.input_split)
+        # print(f"rank:{dist.get_rank()}:after unequal all2all")
+        
         return (None,
-                _AllToAll_UNEQUAL.apply(ctx.group, grad_output[0], 
-                                              ctx.output_split, ctx.input_split),
+                result,
                 None,
                 None)
     
@@ -739,7 +747,8 @@ class MOELayer(Base):
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
-        # logger.debug("input.shape({})".format(input[0].shape)) # 8, 84
+        # print(f"RAW: rank:{dist.get_rank()}, reshaped_input:{reshaped_input}")
+
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -782,6 +791,7 @@ class MOELayer(Base):
             # [[False, False, False,  True],
             #  [False, False, False, False]]
             # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
+            # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
             dispatched_input = einsum("sec,sm->ecm",
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)  # 8, 84
@@ -789,7 +799,11 @@ class MOELayer(Base):
             # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
             # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
             # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+        
+        # print(f"RAW: rank:{dist.get_rank()}, combine_weights:{combine_weights}")
 
+        curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
+        print(f"RAW: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
@@ -814,20 +828,18 @@ class MOELayer(Base):
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
 
         # Re-shape after all-to-all: ecm -> gecm
-        # logger.debug("ep_size:{} num_local_experts:{}".format(self.ep_size, self.num_local_experts)) # 
-        
         dispatched_input = dispatched_input.reshape(self.ep_size,
                                                     self.num_local_experts,
                                                     -1,
                                                     d_model)
-        # logger.debug("after reshape dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 1, 4, 84
-
+        print(f"RAW: rank:{dist.get_rank()}, dispatched_input tokens:{(dispatched_input)}")
         expert_output = self.experts(dispatched_input)
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        print(f"RAW: rank:{dist.get_rank()}, expert_output:{expert_output}")
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
@@ -845,7 +857,6 @@ class MOELayer(Base):
             expert_output = gather_tokens(expert_output, dim=1)
 
         # logger.debug("expert_ouput.shape({}), expert_output:{}".format(expert_output.shape, expert_output))
-        # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
         # enisum: (8, 2, 4), (2, 4, 84) -> (8, 84)
         # combine_weights是sparse的，在(2,4)中，只有一个元素非0，其他都是false
         # einsum计算的结果为当前rank的tokens在expert计算结果 * 相应weight
@@ -858,13 +869,15 @@ class MOELayer(Base):
 
         # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
         a = combined_output.reshape(input[0].shape)
+        # print(f"RAW: rank:{dist.get_rank()}, weighted_sum:{a}")
+        
         # logger.debug("a.shape({}), a:{}".format(a.shape, a))
 
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
-        exit(0)
+        # exit(0)
         return a
 
 
@@ -901,7 +914,7 @@ class DynamicMOELayer(Base):
         self.ep_group = None
         self.ep_size = ep_size
         self.ep_group_name = ep_group_name
-        self.num_local_experts = num_local_experts
+        self.num_local_experts = num_local_experts # num_exp_replica + unique experts
         self.num_exp_replica = num_exp_replica
         self.current_experts = current_experts # current experts indices
         self.time_falltoall = 0.0
@@ -926,6 +939,15 @@ class DynamicMOELayer(Base):
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
 
+    def all_to_all_exchange_size(
+            self,
+            group: torch.distributed.ProcessGroup,
+            input: Tensor) -> Tensor:  # type: ignore
+        input = input.contiguous()
+        output = torch.empty_like(input)
+        dist.all_to_all_single(output, input, group=group)
+        return output
+    
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
         
         intra_comm_group = groups._get_dynamic_expert_all_to_all_group()
@@ -941,7 +963,7 @@ class DynamicMOELayer(Base):
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
-        # logger.debug("input.shape({})".format(input[0].shape)) # 8, 84
+        # print(f"DYNA: rank:{dist.get_rank()}, reshaped_input:{reshaped_input}")
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -959,31 +981,6 @@ class DynamicMOELayer(Base):
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
             # 通过top1 gate之后生成的一个dispatch_mask的具体形式是(num of tokens, num of experts, capacity)
             # 其中num of experts, capacity中，第n行代表分配给第n个expert的token情况，第n列代表当前token是capacity的第几个
-            # 例如dispatch_mask为(8,2,4)的情形时：
-            # [[False, False, False, False],    第一个token 不分配给expert1
-            #  [ True, False, False, False]],                分配给expert2，占用其第一个capacity 1/4
-            
-            # [[ True, False, False, False],    第二个token 分配给expert 1，占用其第一个capacity 1/4
-            #  [False, False, False, False]],               不分配给expert 2
-
-            # [[False, False, False, False],    第三个token  
-            #  [False,  True, False, False]],               分配给expert2，占用其第二个capacity 2/4
-    
-            # [[False,  True, False, False],    第三个token  分配给expert1，占用其第二个capacity 2/4
-            #  [False, False, False, False]],
-    
-            # [[False, False, False, False],
-            #  [False, False,  True, False]],
-    
-            # [[False, False,  True, False],
-            #  [False, False, False, False]],
-    
-            # [[False, False, False, False],
-            #  [False, False, False,  True]],
-    
-            # [[False, False, False,  True],
-            #  [False, False, False, False]]
-            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
             dispatched_input = einsum("sec,sm->ecm", # (num of experts, capacity, dimension)
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)  # 8, 84
@@ -991,70 +988,84 @@ class DynamicMOELayer(Base):
             # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
             # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
             # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+            # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0]))) # 4, 4, 2
+            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 4, 4, 2
+            # logger.debug("dispatched_input.shape({})".format(dispatched_input.shape)) # 4, 4, 2
 
-            _current_capacity = dispatched_input.shape[1]
             chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
-            w = [u.squeeze() for u in chunks]
+            # print(chunks[0].shape)
             curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
-            for i, send in enumerate(curr_exp_counts):
-                w[i] = w[i][0:curr_exp_counts[i]]
-                # if curr_exp_counts[i] == 0:
-                #     w[i] = w[i].reshape(0)
-
-            # print(curr_exp_counts)
-            # print(w)
-            # print(w[0].shape)
-            # print(w[1].shape)
-            # print(w[2].shape)
-            # print(w[3].shape)
+            logger.debug(f"DYNA: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
+            # get updated_weight
+            tokens = []
+            weight = combine_weights.reshape(combine_weights.shape[0], -1)
+            _weight = torch.transpose(weight, 0,1)
+            non_zero_weight = _weight[torch.nonzero(_weight, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            # non_zero_weight = weight[torch.nonzero(_w, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            non_zero_row_indices = torch.nonzero(weight)[:, 0].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            updated_weight = torch.zeros((combine_weights.shape[0], non_zero_weight.shape[1]), 
+                                         device=weight.device, 
+                                         dtype=non_zero_weight.dtype).scatter_(
+                            dim=0, 
+                            index=non_zero_row_indices,
+                            src=non_zero_weight)
+            # print(f"DYNA: rank:{dist.get_rank()}, combine_weights:{combine_weights}")
+            # print(f"DYNA: rank:{dist.get_rank()}, updated_weight:{updated_weight}")
             
+            # get tokens to be sent
+            for i, send in enumerate(curr_exp_counts):
+                tokens.append(chunks[i].squeeze(dim=0)[0:send])
+
             # {num_local_experts} round all2all
-            recv_experts_outputs = []
+            # TODO: expert参数的排布问题 comm group(rank=[1,2], 但是rank1 = exp2, rank2 = exp1)
+            # all_to_all数据排布的问题！！！
+            recv_experts_outputs = [[] for _ in range(dispatched_input.shape[0])]
             for i in range(self.num_local_experts):
                 send_tokens_idx = []
                 for j in range(topology._get_gpu_per_node_number()):
                     send_tokens_idx.append(self.current_intra_node_placement[j][i])
+                
+                # 这里需要将数据的排布顺序与comm group里expert顺序一致
                 # print(f"in round{i} send tokens pos_idx:{send_tokens_idx}") 
                 
-                # first round: exchange size
+                ''' first round: exchange size '''
                 token_send=[]
                 input_split=[]
                 for idx in send_tokens_idx:
-                    token_send.append(w[idx])
-                    input_split.append(w[idx].numel())
+                    token_send.append(tokens[idx])
+                    input_split.append(tokens[idx].numel())
                 token_size2exchange=torch.tensor(input_split, device=token_send[0].device, dtype=torch.int32)
                 
-                # logger.debug(f"token_size2exchange:{token_size2exchange}")
-                
-                output_split = _AllToAll.apply(intra_comm_group, token_size2exchange).tolist()
-                
-                # logger.debug(f"output_split:{output_split}")
+                logger.debug(f"DYNA: rank:{dist.get_rank()} token_size2exchange:{token_size2exchange}")
+                output_split = self.all_to_all_exchange_size(intra_comm_group, token_size2exchange).tolist()
+                logger.debug(f"DYNA: rank:{dist.get_rank()} output_split:{output_split}")
 
-                # second round: exchange data
+                ''' second round: exchange data '''
                 flatten_send_tokens = flatten(token_send)
                 recv_expert_tokens = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_send_tokens,
                                                        input_split, output_split)
-                curr_expert_tokens = recv_expert_tokens.reshape(-1, d_model)
+                curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
+                # print(f"DYNA: rank:{dist.get_rank()}, recv tokens:{(curr_expert_tokens)}")
                 # expert calculation
-                output = self.experts(curr_expert_tokens, i)
-                # print(f"output.shape: {output.shape}, output_split:{output_split}")
+                output = self.experts(curr_expert_tokens, i) #TODO： 这里的index可能与全局的experts不同
                 flatten_results = output.flatten()
                 # send results back
                 expert_outputs = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_results,
                                                        output_split,input_split)
                 
-                # logger.debug(f"expert_outputs.shape: {expert_outputs.shape}, token_send[0].shape:{token_send[0].shape}, token_send[1].shape:{token_send[1].shape}")
                 
-                for _, sync in enumerate(unflatten(expert_outputs, token_send)):
-                    if sync.shape[0]==0: sync = sync.reshape((0, d_model))
-                    sync = torch.nn.functional.pad(
-                        sync, 
-                        (0,0,0,_current_capacity-sync.shape[0]), 
-                        'constant', 
-                        0)
-                    assert sync.shape[0] == _current_capacity
-                    recv_experts_outputs.append(sync)
                 
+                # TODO:在具体的comm group中，谁是rank0，谁是rank1？
+                for i, sync in enumerate(unflatten(expert_outputs, token_send)):
+                    recv_experts_outputs[send_tokens_idx[i]] = sync
+                    # print(f"rank:{dist.get_rank()} data:{sync.shape} should be placed on:{send_tokens_idx[i]}")
+                    # logger.debug(f"rank:{dist.get_rank()}, expert_outputs: {expert_outputs}")
+                
+                # dist.barrier()
+                
+            # print(f"rank:{dist.get_rank()}, recv_experts_outputs: {[p.shape for p in recv_experts_outputs]}")
+            
+            # exit(0)
                 #TODO: GLOBAL experts calc
                 
 
@@ -1080,14 +1091,6 @@ class DynamicMOELayer(Base):
             self.timers('falltoall').stop()
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
 
-        # Re-shape after all-to-all: ecm -> gecm        
-        # dispatched_input = dispatched_input.reshape(self.ep_size,
-        #                                             self.num_local_experts - self.num_exp_replica,
-        #                                             -1,
-        #                                             d_model)
-
-        # expert_output = self.experts(dispatched_input)
-
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
@@ -1099,11 +1102,7 @@ class DynamicMOELayer(Base):
 
         # Re-shape back: gecm -> ecm        
         expert_output = torch.cat(recv_experts_outputs, dim=0) # 横向拼接
-        # print(f"expert_output.shape:{expert_output.shape}")
-        expert_output = expert_output.reshape(self.ep_size * (self.num_local_experts - self.num_exp_replica),
-                                              -1,
-                                              d_model)
-
+        print(f"DYNA: rank:{dist.get_rank()}, expert_output:{expert_output}")
         if groups._get_expert_model_parallel_world_size() == 1:
             # the dropped duplicate tokens need to be gathered on each
             # tensor parallel rank again for the tensor-parallel
@@ -1118,18 +1117,18 @@ class DynamicMOELayer(Base):
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
-            combined_output = einsum("sec,ecm->sm",
-                                     combine_weights.type_as(input[0]),
+            combined_output = einsum("sc,cm->sm",
+                                     updated_weight,
                                      expert_output)
 
         # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
         a = combined_output.reshape(input[0].shape)
         # logger.debug("a.shape({}), a:{}".format(a.shape, a))
+        # print(f"DYNA: rank:{dist.get_rank()}, weighted_sum:{a}")
 
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
-        # exit(0)
         return a
 
