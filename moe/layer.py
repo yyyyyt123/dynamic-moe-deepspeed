@@ -27,7 +27,7 @@ class MoE(torch.nn.Module):
                  use_residual=False,
                  noisy_gate_policy: typing.Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts=True,
+                 use_rts=False,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
                  dyna_threshold: float = 0.015):
@@ -153,7 +153,7 @@ class DynamicMoE(torch.nn.Module):
                  use_residual=False,
                  noisy_gate_policy: typing.Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts=True,
+                 use_rts=False,
                  use_tutel: bool = False,
                  dyna_threshold: float = 0.015,
                  num_exp_replica=1
@@ -179,7 +179,7 @@ class DynamicMoE(torch.nn.Module):
 
         super(DynamicMoE, self).__init__()
         topology._set_total_gpu_number() # TODO: MOVE TO AN APPROPRIATE PLACE
-        topology._set_gpu_per_node_number(2)
+        topology._set_gpu_per_node_number(topology._get_total_gpu_number()//2)
         rank = dist.get_rank()
 
         self.use_residual = use_residual
@@ -193,14 +193,14 @@ class DynamicMoE(torch.nn.Module):
         
         # expert placement on gpus 
         # example: placement->[[0,3],[1,2],[1,2],[0,3]] indicates gpu0 contains exp1&3
-        self.placement = groups._generate_init_placment(local_total_exps=self.num_local_experts, 
+        self.placement = groups._generate_init_placement(local_total_exps=self.num_local_experts, 
                                               num_exp_replica=self.num_exp_replica,
                                               num_exps=self.num_experts)
         # broadcast placement info
         dist.barrier() # can remove this 
         dist.broadcast(self.placement, src=0)
         # get current GPU placement info
-        self.current_experts = self.placement[rank] # current experts indices
+        self.current_experts = self.placement[rank] # indices of experts placement on current gpu
         self.current_experts_name = [f"layer_{self.layer_idx}_expert_{i}" for i in self.current_experts] # current experts name
         self.current_experts_replica_idx = self._get_replica_experts_idx(rank) # indices for replica experts
         # get current intra-node placement info

@@ -118,8 +118,18 @@
    + 标记capacity？ / 或许可以直接根据dispatch情况对dispatched_input的list做分割？
 4. weight
    + 计算weight之前，需要将数据padding打包，之后用于einsum求和
+5. 注意需要保持数据的排布与experts comm group的顺序一致
+   + 即按照升序排列数据
    
 ### Details
 - [x] init 
 - [ ] all2all-unequal 
 - [ ] allreduce_backward
+
+### pytest_case:
+``` shell
+
+cd /research/d1/rshr/ytyang/DeepSpeed/tests/util/moe
+pytest test_model_broadcasr.py
+
+```

@@ -294,7 +294,7 @@ def top1gating(logits: Tensor, # tokens after embedding
     top_idx = _top_idx(mask1_rand, capacity) # 返回 capacity行，expert列，数值为：发送给每个expert的具体tokens的位置(mask1_rand中，按列从大到小排序的下标)
 
     # logger.warning("top_idx.shape({})".format(top_idx.shape)) # 4, 2
-    # logger.warning("top_idx({})".format(top_idx)) # 4, 2
+    # logger.warning(f"top_idx({top_idx})") # 4, 2
 
     new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1) # dim=0，表示在top_idx元素行号用其元素值代替，列号不变，以这两个值索引，在结果new_mask1中填1
     mask1 = new_mask1
@@ -803,7 +803,7 @@ class MOELayer(Base):
         # print(f"RAW: rank:{dist.get_rank()}, combine_weights:{combine_weights}")
 
         curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
-        print(f"RAW: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
+        # print(f"RAW: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
@@ -832,14 +832,14 @@ class MOELayer(Base):
                                                     self.num_local_experts,
                                                     -1,
                                                     d_model)
-        print(f"RAW: rank:{dist.get_rank()}, dispatched_input tokens:{(dispatched_input)}")
+        # print(f"RAW: rank:{dist.get_rank()}, dispatched_input tokens:{(dispatched_input)}")
         expert_output = self.experts(dispatched_input)
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
-        print(f"RAW: rank:{dist.get_rank()}, expert_output:{expert_output}")
+        # print(f"RAW: rank:{dist.get_rank()}, expert_output:{expert_output}")
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
@@ -871,8 +871,6 @@ class MOELayer(Base):
         a = combined_output.reshape(input[0].shape)
         # print(f"RAW: rank:{dist.get_rank()}, weighted_sum:{a}")
         
-        # logger.debug("a.shape({}), a:{}".format(a.shape, a))
-
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
@@ -992,23 +990,28 @@ class DynamicMOELayer(Base):
             # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 4, 4, 2
             # logger.debug("dispatched_input.shape({})".format(dispatched_input.shape)) # 4, 4, 2
 
+            # print(f"DYNA: rank:{dist.get_rank()}, dispatched_input:{dispatched_input}")
+            _current_capacity = dispatched_input.shape[1]
             chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
-            # print(chunks[0].shape)
+
             curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
-            logger.debug(f"DYNA: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
-            # get updated_weight
+            # logger.debug(f"DYNA: rank:{dist.get_rank()}, curr_exp_dispatch_counts:{curr_exp_counts}")
+            
             tokens = []
-            weight = combine_weights.reshape(combine_weights.shape[0], -1)
-            _weight = torch.transpose(weight, 0,1)
-            non_zero_weight = _weight[torch.nonzero(_weight, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            # non_zero_weight = weight[torch.nonzero(_w, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            non_zero_row_indices = torch.nonzero(weight)[:, 0].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            updated_weight = torch.zeros((combine_weights.shape[0], non_zero_weight.shape[1]), 
-                                         device=weight.device, 
-                                         dtype=non_zero_weight.dtype).scatter_(
-                            dim=0, 
-                            index=non_zero_row_indices,
-                            src=non_zero_weight)
+            
+            # # get updated_weight
+            # weight = combine_weights.reshape(combine_weights.shape[0], -1)
+            # _weight = torch.transpose(weight, 0,1)
+            # non_zero_weight = _weight[torch.nonzero(_weight, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            # # non_zero_weight = weight[torch.nonzero(_w, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            # non_zero_row_indices = torch.nonzero(weight)[:, 0].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
+            # updated_weight = torch.zeros((combine_weights.shape[0], non_zero_weight.shape[1]), 
+            #                              device=weight.device, 
+            #                              dtype=non_zero_weight.dtype).scatter_(
+            #                 dim=0, 
+            #                 index=non_zero_row_indices,
+            #                 src=non_zero_weight)
+            
             # print(f"DYNA: rank:{dist.get_rank()}, combine_weights:{combine_weights}")
             # print(f"DYNA: rank:{dist.get_rank()}, updated_weight:{updated_weight}")
             
@@ -1036,9 +1039,9 @@ class DynamicMOELayer(Base):
                     input_split.append(tokens[idx].numel())
                 token_size2exchange=torch.tensor(input_split, device=token_send[0].device, dtype=torch.int32)
                 
-                logger.debug(f"DYNA: rank:{dist.get_rank()} token_size2exchange:{token_size2exchange}")
+                # logger.debug(f"DYNA: rank:{dist.get_rank()} token_size2exchange:{token_size2exchange}")
                 output_split = self.all_to_all_exchange_size(intra_comm_group, token_size2exchange).tolist()
-                logger.debug(f"DYNA: rank:{dist.get_rank()} output_split:{output_split}")
+                # logger.debug(f"DYNA: rank:{dist.get_rank()} output_split:{output_split}")
 
                 ''' second round: exchange data '''
                 flatten_send_tokens = flatten(token_send)
@@ -1057,15 +1060,20 @@ class DynamicMOELayer(Base):
                 
                 # TODO:在具体的comm group中，谁是rank0，谁是rank1？
                 for i, sync in enumerate(unflatten(expert_outputs, token_send)):
+                    if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+                    # print(f"rank:{dist.get_rank()} sync:{sync.shape}")
+                    sync = torch.nn.functional.pad(
+                        sync, 
+                        (0,0,0,_current_capacity - sync.shape[0]), 
+                        'constant', 
+                        0)
+                    assert sync.shape[0] == _current_capacity
                     recv_experts_outputs[send_tokens_idx[i]] = sync
                     # print(f"rank:{dist.get_rank()} data:{sync.shape} should be placed on:{send_tokens_idx[i]}")
                     # logger.debug(f"rank:{dist.get_rank()}, expert_outputs: {expert_outputs}")
                 
                 # dist.barrier()
                 
-            # print(f"rank:{dist.get_rank()}, recv_experts_outputs: {[p.shape for p in recv_experts_outputs]}")
-            
-            # exit(0)
                 #TODO: GLOBAL experts calc
                 
 
@@ -1083,10 +1091,6 @@ class DynamicMOELayer(Base):
             # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
             # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
             
-
-        # dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
-        # logger.debug("After all2all dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
-
         if self.wall_clock_breakdown:
             self.timers('falltoall').stop()
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
@@ -1094,31 +1098,28 @@ class DynamicMOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
-        # expert_output = _AllToAll.apply(self.ep_group, expert_output)
-
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
             self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
 
         # Re-shape back: gecm -> ecm        
         expert_output = torch.cat(recv_experts_outputs, dim=0) # 横向拼接
-        print(f"DYNA: rank:{dist.get_rank()}, expert_output:{expert_output}")
+        expert_output = expert_output.reshape(self.ep_size * (self.num_local_experts - self.num_exp_replica),
+                                              -1,
+                                              d_model)
+        
+        # print(f"DYNA: rank:{dist.get_rank()}, expert_output:{expert_output}")
         if groups._get_expert_model_parallel_world_size() == 1:
             # the dropped duplicate tokens need to be gathered on each
             # tensor parallel rank again for the tensor-parallel
             # non-expert of the next layer.
             expert_output = gather_tokens(expert_output, dim=1)
 
-        # logger.debug("expert_ouput.shape({}), expert_output:{}".format(expert_output.shape, expert_output))
-        # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
-        # enisum: (8, 2, 4), (2, 4, 84) -> (8, 84)
-        # combine_weights是sparse的，在(2,4)中，只有一个元素非0，其他都是false
-        # einsum计算的结果为当前rank的tokens在expert计算结果 * 相应weight
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
-            combined_output = einsum("sc,cm->sm",
-                                     updated_weight,
+            combined_output = einsum("sec,ecm->sm",
+                                     combine_weights.type_as(input[0]),
                                      expert_output)
 
         # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))

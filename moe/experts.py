@@ -50,7 +50,6 @@ class DynamicExperts(torch.nn.Module):
             for name, param in expert.named_parameters():
                 param.allreduce = False
                 param.group_name = curr_name[i]
-                # param.expert_name=curr_name[i]
 
     def forward(self, inputs):
         # logger.debug("experts_inputs.shape({})".format(inputs.shape))
@@ -68,7 +67,7 @@ class DynamicExperts(torch.nn.Module):
 
     def forward(self, inputs, expert_calc_idx):
         expert = self.deepspeed_experts[expert_calc_idx]
-        
+        # assert inputs.shape[0] != 0, f"rank:{torch.distributed.get_rank()}, current input.shape:{inputs.shape}"
         out = expert(inputs)
         if type(out) is tuple:
             out = out[0]  # Ignore the bias term for now

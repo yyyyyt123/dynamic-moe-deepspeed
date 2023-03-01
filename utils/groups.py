@@ -113,7 +113,7 @@ def _create_model_parallel(model_parallel_size_):
 
     return _DATA_PARALLEL_GROUP, _MODEL_PARALLEL_GROUP
 
-def _generate_init_placment(local_total_exps, num_exp_replica, num_exps):
+def _generate_init_placement(local_total_exps, num_exp_replica, num_exps):
     '''
     local_total_exps: 每张GPU上一层内总计存放experts数目
     num_exp_replica: 可以存放副本数量
@@ -131,7 +131,7 @@ def _generate_init_placment(local_total_exps, num_exp_replica, num_exps):
     assert local_total_exps > num_exp_replica
     assert world_size % gpus_per_node == 0
     assert num_exps >= world_size
-    assert local_exp_num * world_size == num_exps
+    assert local_exp_num * world_size == num_exps, f"local_exp_num:{local_exp_num}, world_size={world_size}, num_exps:{num_exps}"
     l=[]
     num=0
     nodes=torch.arange(num_exps).reshape(world_size // gpus_per_node, -1).tolist()
@@ -152,20 +152,36 @@ def _generate_init_placment(local_total_exps, num_exp_replica, num_exps):
             nodes[j // gpus_per_node].append(o)
             
         # print(f"node{j // gpus_per_node}: {nodes[j // gpus_per_node]}")
-        w = sorted(w)
+        w = sorted(w) # TODO: NEED SORTED?
         l.append(w)
     
     return torch.tensor(l, dtype=torch.int32, device=device) if rank==0 else torch.zeros((world_size, local_total_exps), dtype=torch.int32, device = device)
 
 def _convert_gpu_placement_to_experts_groups(placement, num_experts):
+    """convert placement matrix into ranks of comm groups
+
+    Args:
+        placement (Tensor): current placement (un-sorted)
+        num_experts (int): number of all different experts
+
+    Returns:
+        expert_in_gpu: ranks of experts comm groups
+    """
     expert_in_gpu = [ [] for j in range(num_experts)]
     for i, _placement in enumerate(placement):
         for j in _placement:
             expert_in_gpu[j].append(i)
     return expert_in_gpu
 
+
 def _create_dynamic_expert_parallel(placement, layer_idx, num_experts):
-    
+    """ create dynamic experts parallel communication group
+
+    Args:
+        placement (Tensor): un-sorted current placement
+        layer_idx (int): current_layer index
+        num_experts (int): number of all different experts
+    """
     assert dist.is_initialized()
     
     log_dist(
