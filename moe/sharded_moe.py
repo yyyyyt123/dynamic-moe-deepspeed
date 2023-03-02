@@ -914,7 +914,7 @@ class DynamicMOELayer(Base):
         self.ep_group_name = ep_group_name
         self.num_local_experts = num_local_experts # num_exp_replica + unique experts
         self.num_exp_replica = num_exp_replica
-        self.current_experts = current_experts # current experts indices
+        self.current_experts_indices = current_experts.tolist() # current experts indices
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
@@ -946,10 +946,64 @@ class DynamicMOELayer(Base):
         dist.all_to_all_single(output, input, group=group)
         return output
     
+    def single_round(self, 
+                     group: Any,
+                     send_tokens_idx:list,
+                     input_split: list, 
+                     tokens: Tensor,
+                     d_model: int,
+                     _current_capacity,
+                     recv_experts_outputs: list,
+                     expert_index: int
+                     ):
+        """single round all2all communication and expert computation
+
+        Args:
+            group (Any): comm group
+            send_tokens_idx (list): indices to place experts outputs (intra node only)
+            input_split (list): input split of tokens (intra/inter all2all comm)
+            tokens (Tensor): input tokens (intra/inter all2all comm)
+            d_model (int): dimension of model
+            _current_capacity (_type_): capacity (for padding)
+            recv_experts_outputs (list): experts outputs (after all2all comm)
+            expert_index (int): index of expert in computation
+        """
+        device = torch.cuda.current_device()
+
+        exchange_size=torch.tensor(input_split, device=device, dtype=torch.int32)
+        output_split = self.all_to_all_exchange_size(group, exchange_size).tolist()
+        
+        flatten_send_tokens = flatten(tokens)
+        recv_expert_tokens = _AllToAll_UNEQUAL.apply(group, flatten_send_tokens,
+                                                input_split, output_split)
+        curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
+        output = self.experts(curr_expert_tokens, expert_index)
+        flatten_results = output.flatten()
+        # send results back
+        expert_outputs = _AllToAll_UNEQUAL.apply(group, flatten_results,
+                                                output_split,input_split)
+        
+        for i, sync in enumerate(unflatten(expert_outputs, tokens)):
+            # if processing world all2all, skip placing results of local experts
+            if recv_experts_outputs[i] != [] and group is None: continue
+            # calc output placement index
+            output_index = i if group is None else send_tokens_idx[i]
+            # padding for einsum
+            if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+            sync = torch.nn.functional.pad(
+                sync, 
+                (0,0,0,_current_capacity - sync.shape[0]), 
+                'constant', 
+                0)
+            assert sync.shape[0] == _current_capacity
+            # place the output in an appropriate place
+            recv_experts_outputs[output_index] = sync
+        
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
         
         intra_comm_group = groups._get_dynamic_expert_all_to_all_group()
-        
+        device = torch.cuda.current_device()
+
         if self.wall_clock_breakdown:
             self.timers('moe').start()
 
@@ -985,10 +1039,6 @@ class DynamicMOELayer(Base):
             # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
             # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
             # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
-            # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
-            # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0]))) # 4, 4, 2
-            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 4, 4, 2
-            # logger.debug("dispatched_input.shape({})".format(dispatched_input.shape)) # 4, 4, 2
 
             # print(f"DYNA: rank:{dist.get_rank()}, dispatched_input:{dispatched_input}")
             _current_capacity = dispatched_input.shape[1]
@@ -999,19 +1049,6 @@ class DynamicMOELayer(Base):
             
             tokens = []
             
-            # # get updated_weight
-            # weight = combine_weights.reshape(combine_weights.shape[0], -1)
-            # _weight = torch.transpose(weight, 0,1)
-            # non_zero_weight = _weight[torch.nonzero(_weight, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            # # non_zero_weight = weight[torch.nonzero(_w, as_tuple=True)].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            # non_zero_row_indices = torch.nonzero(weight)[:, 0].unsqueeze(dim=0) # shape: 1, non_zero_elem_size
-            # updated_weight = torch.zeros((combine_weights.shape[0], non_zero_weight.shape[1]), 
-            #                              device=weight.device, 
-            #                              dtype=non_zero_weight.dtype).scatter_(
-            #                 dim=0, 
-            #                 index=non_zero_row_indices,
-            #                 src=non_zero_weight)
-            
             # print(f"DYNA: rank:{dist.get_rank()}, combine_weights:{combine_weights}")
             # print(f"DYNA: rank:{dist.get_rank()}, updated_weight:{updated_weight}")
             
@@ -1019,17 +1056,14 @@ class DynamicMOELayer(Base):
             for i, send in enumerate(curr_exp_counts):
                 tokens.append(chunks[i].squeeze(dim=0)[0:send])
 
+            # local experts computation
             # {num_local_experts} round all2all
-            # TODO: expert参数的排布问题 comm group(rank=[1,2], 但是rank1 = exp2, rank2 = exp1)
-            # all_to_all数据排布的问题！！！
             recv_experts_outputs = [[] for _ in range(dispatched_input.shape[0])]
             for i in range(self.num_local_experts):
                 send_tokens_idx = []
                 for j in range(topology._get_gpu_per_node_number()):
                     send_tokens_idx.append(self.current_intra_node_placement[j][i])
                 
-                # 这里需要将数据的排布顺序与comm group里expert顺序一致
-                # print(f"in round{i} send tokens pos_idx:{send_tokens_idx}") 
                 
                 ''' first round: exchange size '''
                 token_send=[]
@@ -1037,46 +1071,88 @@ class DynamicMOELayer(Base):
                 for idx in send_tokens_idx:
                     token_send.append(tokens[idx])
                     input_split.append(tokens[idx].numel())
-                token_size2exchange=torch.tensor(input_split, device=token_send[0].device, dtype=torch.int32)
+                    tokens[idx]=torch.tensor([], dtype=tokens[idx].dtype, device=device)
                 
-                # logger.debug(f"DYNA: rank:{dist.get_rank()} token_size2exchange:{token_size2exchange}")
-                output_split = self.all_to_all_exchange_size(intra_comm_group, token_size2exchange).tolist()
-                # logger.debug(f"DYNA: rank:{dist.get_rank()} output_split:{output_split}")
+                self.single_round(group=intra_comm_group,
+                                  send_tokens_idx=send_tokens_idx,
+                                  input_split=input_split,
+                                  tokens=token_send,
+                                  d_model=d_model,
+                                  _current_capacity=_current_capacity,
+                                  recv_experts_outputs=recv_experts_outputs,
+                                  expert_index=i)
+                
+                # token_size2exchange=torch.tensor(input_split, device=device, dtype=torch.int32)
+                
+                # # logger.debug(f"DYNA: rank:{dist.get_rank()} token_size2exchange:{token_size2exchange}")
+                # output_split = self.all_to_all_exchange_size(intra_comm_group, token_size2exchange).tolist()
+                # # logger.debug(f"DYNA: rank:{dist.get_rank()} output_split:{output_split}")
 
-                ''' second round: exchange data '''
-                flatten_send_tokens = flatten(token_send)
-                recv_expert_tokens = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_send_tokens,
-                                                       input_split, output_split)
-                curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
-                # print(f"DYNA: rank:{dist.get_rank()}, recv tokens:{(curr_expert_tokens)}")
-                # expert calculation
-                output = self.experts(curr_expert_tokens, i) #TODO： 这里的index可能与全局的experts不同
-                flatten_results = output.flatten()
-                # send results back
-                expert_outputs = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_results,
-                                                       output_split,input_split)
-                
-                
-                
-                # TODO:在具体的comm group中，谁是rank0，谁是rank1？
-                for i, sync in enumerate(unflatten(expert_outputs, token_send)):
-                    if sync.shape[0]==0: sync = sync.reshape((0, d_model))
-                    # print(f"rank:{dist.get_rank()} sync:{sync.shape}")
-                    sync = torch.nn.functional.pad(
-                        sync, 
-                        (0,0,0,_current_capacity - sync.shape[0]), 
-                        'constant', 
-                        0)
-                    assert sync.shape[0] == _current_capacity
-                    recv_experts_outputs[send_tokens_idx[i]] = sync
-                    # print(f"rank:{dist.get_rank()} data:{sync.shape} should be placed on:{send_tokens_idx[i]}")
-                    # logger.debug(f"rank:{dist.get_rank()}, expert_outputs: {expert_outputs}")
-                
-                # dist.barrier()
-                
-                #TODO: GLOBAL experts calc
-                
+                # ''' second round: exchange data '''
+                # flatten_send_tokens = flatten(token_send)
+                # recv_expert_tokens = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_send_tokens,
+                #                                        input_split, output_split)
+                # curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
+                # # print(f"DYNA: rank:{dist.get_rank()}, recv tokens:{(curr_expert_tokens)}")
+                # # expert calculation
+                # output = self.experts(curr_expert_tokens, i) #TODO： 这里的index可能与全局的experts不同
+                # flatten_results = output.flatten()
+                # # send results back
+                # expert_outputs = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_results,
+                #                                        output_split,input_split)
 
+                # for i, sync in enumerate(unflatten(expert_outputs, token_send)):
+                #     if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+                #     # print(f"rank:{dist.get_rank()} sync:{sync.shape}")
+                #     sync = torch.nn.functional.pad(
+                #         sync, 
+                #         (0,0,0,_current_capacity - sync.shape[0]), 
+                #         'constant', 
+                #         0)
+                #     assert sync.shape[0] == _current_capacity
+                #     recv_experts_outputs[send_tokens_idx[i]] = sync
+               
+            # GLOBAL experts calc
+            _global_tokens_size = []
+            for t in tokens:
+                _global_tokens_size.append(t.numel())
+                
+            self.single_round(group=None,
+                            send_tokens_idx=None,
+                            input_split=_global_tokens_size,
+                            tokens=tokens,
+                            d_model=d_model,
+                            _current_capacity=_current_capacity,
+                            recv_experts_outputs=recv_experts_outputs,
+                            expert_index=self.current_experts_indices.index(dist.get_rank()))
+            
+            # # print(_global_tokens_size)
+            # global_exchange_size=torch.tensor(_global_tokens_size, device=device, dtype=torch.int32)
+            # output_split = self.all_to_all_exchange_size(None, global_exchange_size).tolist()
+            
+            # flatten_send_tokens = flatten(tokens)
+            # recv_expert_tokens = _AllToAll_UNEQUAL.apply(None, flatten_send_tokens,
+            #                                         _global_tokens_size, output_split)
+            # curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
+            # output = self.experts(curr_expert_tokens, 0) #TODO： 这里的index可能与全局的experts不同
+            # flatten_results = output.flatten()
+            # # send results back
+            # expert_outputs = _AllToAll_UNEQUAL.apply(None, flatten_results,
+            #                                         output_split,_global_tokens_size)
+            
+            # for i, sync in enumerate(unflatten(expert_outputs, tokens)):
+            #     if recv_experts_outputs[i] != []: continue
+            #     if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+            #     sync = torch.nn.functional.pad(
+            #         sync, 
+            #         (0,0,0,_current_capacity - sync.shape[0]), 
+            #         'constant', 
+            #         0)
+            #     assert sync.shape[0] == _current_capacity
+            #     recv_experts_outputs[i] = sync
+
+        # print(recv_experts_outputs)
+        
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
 

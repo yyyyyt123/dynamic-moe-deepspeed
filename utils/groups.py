@@ -152,7 +152,7 @@ def _generate_init_placement(local_total_exps, num_exp_replica, num_exps):
             nodes[j // gpus_per_node].append(o)
             
         # print(f"node{j // gpus_per_node}: {nodes[j // gpus_per_node]}")
-        w = sorted(w) # TODO: NEED SORTED?
+        w = sorted(w) # NO NEED TO SORT!!
         l.append(w)
     
     return torch.tensor(l, dtype=torch.int32, device=device) if rank==0 else torch.zeros((world_size, local_total_exps), dtype=torch.int32, device = device)
