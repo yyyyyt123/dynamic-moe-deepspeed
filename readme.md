@@ -30,11 +30,11 @@
 
 ## Todo
 ### Phase1
-- [ ] Expert parallel init: set up expert-data-parallel-group
-- [ ] Start training1: remove all_to_all param that can be computed locally (replace with all zero)
-- [ ] Start training2: compute locally
+- [x] Expert parallel init: set up expert-data-parallel-group
+- [x] Start training1: remove all_to_all param that can be computed locally (replace with all zero)
+- [x] Start training2: compute locally
 - [ ] Start training3: at the end of each round, use `reduce` premitive to calculate the load trace
-- [ ] End of training: check all reduce for moe parameters
+- [x] End of training: check all reduce for moe parameters
 - [ ] Reach specified steps1: use gurobi to calculate placement policy
 - [ ] Reach specified steps2: exchange experts parameters
 
@@ -123,8 +123,8 @@
    
 ### Details
 - [x] init 
-- [ ] all2all-unequal 
-- [ ] allreduce_backward
+- [x] all2all-unequal 
+- [x] allreduce_backward
 
 ### pytest_case:
 ``` shell

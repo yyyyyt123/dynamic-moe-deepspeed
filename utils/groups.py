@@ -129,6 +129,7 @@ def _generate_init_placement(local_total_exps, num_exp_replica, num_exps):
     local_exp_num = local_total_exps - num_exp_replica # 每个GPU上独立的Expert个数
     ''' check args sanity'''
     assert local_total_exps > num_exp_replica
+    assert local_total_exps * gpus_per_node <= num_exps # 保证每个intra node expert不重复
     assert world_size % gpus_per_node == 0
     assert num_exps >= world_size
     assert local_exp_num * world_size == num_exps, f"local_exp_num:{local_exp_num}, world_size={world_size}, num_exps:{num_exps}"
@@ -151,8 +152,8 @@ def _generate_init_placement(local_total_exps, num_exp_replica, num_exps):
             w.append(o)
             nodes[j // gpus_per_node].append(o)
             
-        # print(f"node{j // gpus_per_node}: {nodes[j // gpus_per_node]}")
-        w = sorted(w) # NO NEED TO SORT!!
+        # 这里需要sort，否则再init_distributed时，因为broadcast顺序的问题，会出现死锁
+        w = sorted(w) 
         l.append(w)
     
     return torch.tensor(l, dtype=torch.int32, device=device) if rank==0 else torch.zeros((world_size, local_total_exps), dtype=torch.int32, device = device)

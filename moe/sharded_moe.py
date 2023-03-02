@@ -1065,7 +1065,7 @@ class DynamicMOELayer(Base):
                     send_tokens_idx.append(self.current_intra_node_placement[j][i])
                 
                 
-                ''' first round: exchange size '''
+                ''' first round: intra node '''
                 token_send=[]
                 input_split=[]
                 for idx in send_tokens_idx:
@@ -1113,6 +1113,7 @@ class DynamicMOELayer(Base):
                 #     recv_experts_outputs[send_tokens_idx[i]] = sync
                
             # GLOBAL experts calc
+            ''' second round: inter node '''
             _global_tokens_size = []
             for t in tokens:
                 _global_tokens_size.append(t.numel())

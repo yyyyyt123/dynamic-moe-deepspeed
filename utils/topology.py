@@ -25,7 +25,7 @@ def _get_gpu_per_node_number():
 def _set_gpu_per_node_number(number):
     global _GPUS_PER_NODE
     
-    _GPUS_PER_NODE = 1 # for experiment only
+    _GPUS_PER_NODE = number # for experiment only
     # _GPUS_PER_NODE = number # for experiment only
     # _GPUS_PER_NODE = torch.cuda.device_count()
     
