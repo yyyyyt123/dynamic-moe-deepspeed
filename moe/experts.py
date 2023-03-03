@@ -44,6 +44,7 @@ class DynamicExperts(torch.nn.Module):
         self.deepspeed_experts = torch.nn.ModuleList(
             [copy.deepcopy(expert) for i in range(num_local_experts)])
         self.num_local_experts = num_local_experts
+        self.curr_name = curr_name
 
         for i, expert in enumerate(self.deepspeed_experts):
             
