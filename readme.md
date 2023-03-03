@@ -28,22 +28,6 @@
 + remove part of All_to_All communication parameters (for local computation)
 + change placement policy: broadcast parameters
 
-## Todo
-### Phase1
-- [x] Expert parallel init: set up expert-data-parallel-group
-- [x] Start training1: remove all_to_all param that can be computed locally (replace with all zero)
-- [x] Start training2: compute locally
-- [ ] Start training3: at the end of each round, use `reduce` premitive to calculate the load trace
-- [x] End of training: check all reduce for moe parameters
-- [ ] Reach specified steps1: use gurobi to calculate placement policy
-- [ ] Reach specified steps2: exchange experts parameters
-
-### Phase2
-- [x] All_to_All: use the method in fastmoe, exchange buffer size before real data 
-
-
-
-
 ## Plan
 ### Steps
 1. 现有的Placement策略：
@@ -63,14 +47,6 @@
 6. 达到特定轮次后，开启gurobi优化
    + change experts placement
    + change globalPostion array
-
-### Preliminary
-- [x] How to use unequal split all2all communication?
-- [x] How to exchange globalPostion
-- [x] How to exchange experts parameters
-- [x] Can these all_reduce/broadcast operation be executed in parallel?
-- [x] How to all_reduce experts params?
-- [ ] Read zero optimization in deepspeed
 
 ### misc
 + `expert_parallel_size_`: 所有不同的experts（不考虑数据并行）占据了多少个GPUs
@@ -105,31 +81,26 @@
      + KEY: `_EXPERT_NAME`      : 当前保存的experts名称 (group name) 例如"layer_1_expert_13"
      + VALUE: `_PROCESS_GROUP`  ：process_group信息
 
-### All_to_All 
-1. 每个intra-node内先做num_local_experts轮的all_to_all communication，交换intra-node内数据信息
-    + 使用dist.new_subgroups()创建all_to_all的通信group
-    + 注意出现一个node内存在同一个expert的副本的情况
-2. 使用unequal all_to_all的forward & backward 需要修改
-   + ctx中需要保input_split与output_split,用于backward计算
-3. dispatched_input: shape(num of experts, capacity, dimension)
-   + 先将数据分到list中
-   + 判断是否存在全0token的情况 -> dimension=1求和是否为0
-   + 去除尾部的tokens
-   + 标记capacity？ / 或许可以直接根据dispatch情况对dispatched_input的list做分割？
-4. weight
-   + 计算weight之前，需要将数据padding打包，之后用于einsum求和
-5. 注意需要保持数据的排布与experts comm group的顺序一致
-   + 即按照升序排列数据
-   
-### Details
-- [x] init 
-- [x] all2all-unequal 
-- [x] allreduce_backward
-
 ### pytest_case:
 ``` shell
 
 cd /research/d1/rshr/ytyang/DeepSpeed/tests/util/moe
-pytest test_model_broadcasr.py
+pytest test_model_broadcast.py
 
 ```
+
+## Todo
+- [x] Expert parallel init: set up expert-data-parallel-group
+- [x] Start training1: remove all_to_all param that can be computed locally (replace with all zero)
+- [x] Start training2: compute locally
+- [ ] Start training3: at the end of each round, use `reduce` premitive to calculate the load trace
+- [x] End of training: check all reduce for moe parameters
+- [ ] Reach specified steps1: use gurobi to calculate placement policy
+- [ ] Reach specified steps2: exchange experts parameters
+
+## Next Week
+- [ ] 重写全局all2all与expert计算
+- [ ] 在transformer-xl上实验dynamic placement (random)
+- [ ] all_reduce (SUM) 计算 experts tokens dispatch
+- [ ] 引入gurobi expert placement calculation
+- [ ] 参数all_reduce时，按照fed-AVG处理
