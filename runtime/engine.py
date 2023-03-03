@@ -1816,7 +1816,7 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_inner_timers)
         
-        # print("prepared for backward !")
+        print("prepared for backward !")
 
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
@@ -1847,7 +1847,7 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_reduce_timers)
 
-        # print("backward okkkkkkkk !")
+        print("backward okkkkkkkk !")
         
         if allreduce_gradients and self.enable_backward_allreduce:
         #     # Traditional code path that allreduces the module parameter grads
