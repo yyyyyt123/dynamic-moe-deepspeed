@@ -99,7 +99,8 @@ pytest test_model_broadcast.py
 - [ ] Reach specified steps2: exchange experts parameters
 
 ## Next Week
-- [ ] 重写全局all2all与expert计算
+- [x] 重写全局all2all与expert计算
+- [ ] add pytest for regression test
 - [ ] 在transformer-xl上实验dynamic placement (random)
 - [ ] all_reduce (SUM) 计算 experts tokens dispatch
 - [ ] 引入gurobi expert placement calculation

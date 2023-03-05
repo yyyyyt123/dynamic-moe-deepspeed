@@ -973,7 +973,7 @@ class DynamicMOELayer(Base):
                                                 input_split, output_split)
         curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
         output = self.experts(curr_expert_tokens, expert_index)
-        output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert {self.experts.curr_name[expert_index]} calc finish"))
+        # output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert {self.experts.curr_name[expert_index]} calc finish"))
         flatten_results = output.flatten()
         # send results back
         expert_outputs = _AllToAll_UNEQUAL.apply(group, flatten_results,
@@ -996,6 +996,89 @@ class DynamicMOELayer(Base):
             # place the output in an appropriate place
             recv_experts_outputs[output_index] = sync
         
+    def inter_round(self, 
+                     group: Any,
+                     send_tokens_idx:list,
+                     input_split: list, 
+                     tokens: Tensor,
+                     d_model: int,
+                     _current_capacity,
+                     recv_experts_outputs: list,
+                     current_experts_indices: list,
+                     num_local_unique_experts: int
+                     ):
+        """single round all2all communication and expert computation
+
+        Args:
+            group (Any): comm group
+            send_tokens_idx (list): indices to place experts outputs (intra node only)
+            input_split (list): input split of tokens (intra/inter all2all comm)
+            tokens (Tensor): input tokens (intra/inter all2all comm)
+            d_model (int): dimension of model
+            _current_capacity (_type_): capacity (for padding)
+            recv_experts_outputs (list): experts outputs (after all2all comm)
+            expert_index (int): index of expert in computation
+        """
+        device = torch.cuda.current_device()
+        # exchange size
+        exchange_size=torch.tensor(input_split, device=device, dtype=torch.int32)
+        output_split = self.all_to_all_exchange_size(group, exchange_size).tolist()
+        _combined_input_split=[]
+        _combined_output_split=[]
+        for i in range(0, len(input_split), num_local_unique_experts):
+            _combined_input_split.append (sum(input_split [i: i+num_local_unique_experts]))
+            _combined_output_split.append(sum(output_split[i: i+num_local_unique_experts]))
+            
+        # exchange tokens
+        flatten_send_tokens = flatten(tokens)
+        recv_expert_tokens = _AllToAll_UNEQUAL.apply(group, flatten_send_tokens,
+                                                _combined_input_split, _combined_output_split)
+        curr_expert_tokens = recv_expert_tokens.reshape((-1, d_model))
+
+        _output_split_s = [o//d_model for o in output_split]
+        _recv_tokens_split= list(torch.split(curr_expert_tokens, split_size_or_sections=_output_split_s, dim=0))
+        
+        output_send_back=[[] for _ in range(len(output_split))]
+        for i in range(num_local_unique_experts):
+            # get tokens for one expert
+            _tokens_2_experts = _recv_tokens_split[i::num_local_unique_experts]
+            # get size of the tokens in calculation
+            _size = _output_split_s[i::num_local_unique_experts]
+            # concatenate the tokens 
+            _tokens_in_use = torch.cat(_tokens_2_experts, dim=0)
+            # calc expert index in calculation
+            expert_index = current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i)
+            # expert calculate results
+            _expert_output = self.experts(_tokens_in_use, expert_index)
+            # split back
+            expert_output_split = torch.split(_expert_output, split_size_or_sections = _size, dim=0)
+            # put elements back in tensor list
+            output_send_back[i::num_local_unique_experts] = expert_output_split
+        
+        # output = self.experts(curr_expert_tokens, expert_index)
+        # output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert {self.experts.curr_name[expert_index]} calc finish"))
+        flatten_results = flatten(output_send_back)
+        # send results back
+        expert_outputs = _AllToAll_UNEQUAL.apply(group, flatten_results,
+                                                _combined_output_split, _combined_input_split)
+        # expert_outputs.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, backward all2all expert_outputs:{expert_outputs.shape}"))
+        
+        for i, sync in enumerate(unflatten(expert_outputs, tokens)):
+            # calc output placement index
+            output_index = send_tokens_idx[i]
+            # if processing world all2all, skip placing results of local experts
+            if recv_experts_outputs[output_index] != []: continue
+            # padding for einsum
+            if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+            sync = torch.nn.functional.pad(
+                sync, 
+                (0,0,0,_current_capacity - sync.shape[0]), 
+                'constant', 
+                0)
+            assert sync.shape[0] == _current_capacity
+            # place the output in an appropriate place
+            recv_experts_outputs[output_index] = sync
+
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
         
         intra_comm_group = groups._get_dynamic_expert_all_to_all_group()
@@ -1069,7 +1152,7 @@ class DynamicMOELayer(Base):
                 input_split=[]
                 for idx in send_tokens_idx:
                     token_send.append(tokens[idx])
-                    tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, intra-grad {grad.shape} calc finish"))
+                    # tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, intra-grad {grad.shape} calc finish"))
                     input_split.append(tokens[idx].numel())
                 self.single_round(group=intra_comm_group,
                                   send_tokens_idx=send_tokens_idx,
@@ -1083,32 +1166,68 @@ class DynamicMOELayer(Base):
             ''' second round: inter node '''
             # TODO: rewrite global communication, in case of global exchange tokens with size [0,0,0,0]
             num_local_unique_experts = self.num_local_experts - self.num_exp_replica
-            for i in range(num_local_unique_experts):
-                send_tokens_idx = []
-                global_token_send=[]
-                global_input_split = []
-                for idx in range(i, dispatched_input.shape[0], num_local_unique_experts):
+            send_tokens_idx = []
+            global_token_send=[]
+            global_token_send_split=[]
+            for i in range(dist.get_world_size()):
+                _tokens_global=[]
+                _tokens_global_size=[]
+                for idx in range(i * num_local_unique_experts, (i+1) * num_local_unique_experts):
                     send_tokens_idx.append(idx)
                     if idx not in _processed_idx:
-                        global_token_send.append(tokens[idx])
-                        global_input_split.append(tokens[idx].numel())
+                        _tokens_global.append(tokens[idx])
+                        _tokens_global_size.append(tokens[idx].numel())
+                        # global_input_split.append(tokens[idx].numel())
                         _processed_idx.append(idx)
-                        tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, inter-grad {grad.shape} finish"))
-                        
                     else:
                         _send_empty=torch.tensor([], dtype=dtype, device=device)
-                        global_token_send.append(_send_empty)
-                        global_input_split.append(0)
+                        _tokens_global.append(_send_empty)
+                        _tokens_global_size.append(0)
+                global_token_send.extend(_tokens_global)
+                global_token_send_split.extend(_tokens_global_size)
 
-                print(f"**** inter_all_to_all, input_split:{global_input_split} token send by expert{self.experts.curr_name[self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i)]} ****")
-                self.single_round(group=None,
-                            send_tokens_idx=send_tokens_idx,
-                            input_split=global_input_split,
-                            tokens=global_token_send,
-                            d_model=d_model,
-                            _current_capacity=_current_capacity,
-                            recv_experts_outputs=recv_experts_outputs,
-                            expert_index=self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i))
+            self.inter_round(group=None,
+                send_tokens_idx=send_tokens_idx,
+                input_split=global_token_send_split,
+                tokens=global_token_send,
+                d_model=d_model,
+                _current_capacity=_current_capacity,
+                recv_experts_outputs=recv_experts_outputs,
+                current_experts_indices=self.current_experts_indices,
+                num_local_unique_experts=num_local_unique_experts,
+            )
+                        # global_token_send.append(_send_empty)
+                        # global_input_split.append(0)
+                        # tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, inter-grad {grad.shape} finish"))
+            
+            # original code
+            # num_local_unique_experts = self.num_local_experts - self.num_exp_replica
+            # for i in range(num_local_unique_experts):
+            #     send_tokens_idx = []
+            #     global_token_send=[]
+            #     global_input_split = []
+            #     for idx in range(i, dispatched_input.shape[0], num_local_unique_experts):
+            #         send_tokens_idx.append(idx)
+            #         if idx not in _processed_idx:
+            #             global_token_send.append(tokens[idx])
+            #             global_input_split.append(tokens[idx].numel())
+            #             _processed_idx.append(idx)
+            #             tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, inter-grad {grad.shape} finish"))
+                        
+            #         else:
+            #             _send_empty=torch.tensor([], dtype=dtype, device=device)
+            #             global_token_send.append(_send_empty)
+            #             global_input_split.append(0)
+
+            #     print(f"**** inter_all_to_all, input_split:{global_input_split} token send by expert{self.experts.curr_name[self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i)]} ****")
+            #     self.single_round(group=None,
+            #                 send_tokens_idx=send_tokens_idx,
+            #                 input_split=global_input_split,
+            #                 tokens=global_token_send,
+            #                 d_model=d_model,
+            #                 _current_capacity=_current_capacity,
+            #                 recv_experts_outputs=recv_experts_outputs,
+            #                 expert_index=self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i))
         
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
@@ -1141,7 +1260,7 @@ class DynamicMOELayer(Base):
         expert_output = expert_output.reshape(self.ep_size * (self.num_local_experts - self.num_exp_replica),
                                               -1,
                                               d_model)
-        expert_output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert_output grad {grad.shape} calc finish"))
+        # expert_output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert_output grad {grad.shape} calc finish"))
         
         
         if groups._get_expert_model_parallel_world_size() == 1:
