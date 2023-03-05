@@ -56,6 +56,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
+from deepspeed.utils import topology
 from deepspeed.utils import logger, log_dist, instrument_w_nvtx
 from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
@@ -71,7 +72,7 @@ from .utils import ensure_directory_exists, get_ma_status
 from ..ops.op_builder import UtilsBuilder
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
-from ..moe.layer import MoE
+from ..moe.layer import MoE, DynamicMoE
 from ..moe.utils import is_moe_param
 from ..git_version_info import version
 
@@ -192,6 +193,7 @@ class DeepSpeedEngine(Module):
         config=None,
         config_params=None,
         dont_change_device=False,
+        dynamic_expert_placement=False,
     ):
         super(DeepSpeedEngine, self).__init__()
         self.dont_change_device = dont_change_device
@@ -224,6 +226,8 @@ class DeepSpeedEngine(Module):
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
 
+        self.dynamic_expert_placement = dynamic_expert_placement
+        
         self.checkpoint_engine = None
 
         global dist
@@ -374,6 +378,8 @@ class DeepSpeedEngine(Module):
         util_ops = UtilsBuilder().load()
         self.flatten = util_ops.flatten
         self.unflatten = util_ops.unflatten
+        
+
 
     def destroy(self):
         if self.optimizer is not None and hasattr(self.optimizer, 'destroy'):
@@ -992,7 +998,12 @@ class DeepSpeedEngine(Module):
             # Broadcast the model for different parameters
             if is_moe_param(p):
                 if torch.is_tensor(p) and is_replicated(p):
-                    dist.broadcast(p,
+                    if p.group_name[:5]=='layer':
+                        dist.broadcast(p,
+                                   groups._get_dynamic_expert_broadcast_src_rank(p.group_name),
+                                   group=self.dynamic_expert_parallel_group[p.group_name])
+                    else:
+                        dist.broadcast(p,
                                    groups._get_expert_broadcast_src_rank(p.group_name),
                                    group=self.expert_data_parallel_group[p.group_name])
             else:
@@ -1057,6 +1068,9 @@ class DeepSpeedEngine(Module):
             if isinstance(module, MoE):
                 self.has_moe_layers = True
                 self.num_experts.append(module.num_experts)
+            elif isinstance(module, DynamicMoE):
+                self.has_moe_layers = True
+                self.num_experts.append(module.num_experts)
 
         if self.has_moe_layers:
             for _, module in self.module.named_modules():
@@ -1084,6 +1098,7 @@ class DeepSpeedEngine(Module):
         self.mp_world_size = groups._get_model_parallel_world_size()
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
+        self.dynamic_expert_parallel_group = groups._get_dynamic_expert_parallel_group_dict()
 
         if not self.amp_enabled():
             self._broadcast_model()
@@ -1800,6 +1815,8 @@ class DeepSpeedEngine(Module):
             "must provide optimizer during init in order to use backward"
 
         self._start_timers(self.engine_timers.backward_inner_timers)
+        
+        # print("prepared for backward !")
 
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
@@ -1830,8 +1847,10 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_reduce_timers)
 
+        # print(f" rank:{dist.get_rank()}, backward okkkkkkkk !")
+        
         if allreduce_gradients and self.enable_backward_allreduce:
-            # Traditional code path that allreduces the module parameter grads
+        #     # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
 
         self._stop_timers(self.engine_timers.backward_reduce_timers)
@@ -2220,8 +2239,19 @@ class DeepSpeedEngine(Module):
     def _get_gradients_for_reduction(self):
         non_expert_grads = []
         expert_grads = {}
-        if self.has_moe_layers:
-            for key in self.expert_data_parallel_group.keys():
+        
+        group=None
+        # print(f"self.has_moe_layers:{self.has_moe_layers}")
+        # print(f"self.dynamic_expert_placement:{self.dynamic_expert_placement}")
+        if self.has_moe_layers and self.dynamic_expert_placement:
+            group = self.dynamic_expert_parallel_group
+            # print("hererererer")
+        elif self.has_moe_layers:
+            group = self.expert_data_parallel_group
+            
+        # print(group, "*"*10)
+        if group is not None:
+            for key in group.keys():
                 expert_grads[key] = []
 
         for param_name, param in self.module.named_parameters():
@@ -2279,6 +2309,22 @@ class DeepSpeedEngine(Module):
                         bucket,
                         dp_group=groups._get_expert_data_parallel_group(ep_name),
                         numel_per_bucket=elements_per_buffer)
+    
+    def _reduce_dynamic_expert_gradients(self, expert_grads, elements_per_buffer):
+        for ep_name, expert_grads_group in expert_grads.items():
+            expert_split_buckets = split_half_float_double_sparse(expert_grads_group)
+            for i, bucket_tuple in enumerate(expert_split_buckets):
+                bucket_type, bucket = bucket_tuple
+                if bucket_type == SparseTensor.type():
+                    self.sparse_allreduce_no_retain(
+                        bucket,
+                        groups._get_expert_data_parallel_group(ep_name))
+                else:
+                    # Separate between diff groups
+                    self.allreduce_no_retain(
+                        bucket,
+                        dp_group=groups._get_dynamic_expert_parallel_group(ep_name),
+                        numel_per_bucket=elements_per_buffer)
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         if grads is None:
@@ -2290,7 +2336,10 @@ class DeepSpeedEngine(Module):
         self._reduce_non_expert_gradients(non_expert_grads, elements_per_buffer)
 
         if self.has_moe_layers:
-            self._reduce_expert_gradients(expert_grads, elements_per_buffer)
+            if self.dynamic_expert_placement:
+                self._reduce_dynamic_expert_gradients(expert_grads, elements_per_buffer)
+            else:
+                self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
     def sparse_allreduce_no_retain(self, bucket, dp_group):
         allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group)

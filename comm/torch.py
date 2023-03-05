@@ -167,6 +167,9 @@ class TorchBackend(Backend):
     def new_group(self, ranks):
         return torch.distributed.new_group(ranks)
 
+    def new_subgroups(self):
+        return torch.distributed.new_subgroups()
+    
     def get_global_rank(self, group, group_rank):
         return torch.distributed.distributed_c10d._get_global_rank(group, group_rank)
 
