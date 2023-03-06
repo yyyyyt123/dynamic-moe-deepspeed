@@ -9,11 +9,6 @@
 2. In `runtime/dataloader.py`: add `dataloader.set_spoch(epoch)` to shuffle the deepspeed trainloader. To disable shuffle, just use the fix number rather epoch `dataloader.set_spoch(0)` (`DeepSpeedDataLoader.set_epoch(...)`)
 
 
-## Plan
-1. change the placement of experts on regular basis
-2. change the all_to_all dispatch
-
-
 ## Details
 
 ### All_to_All
@@ -28,25 +23,6 @@
 + remove part of All_to_All communication parameters (for local computation)
 + change placement policy: broadcast parameters
 
-## Plan
-### Steps
-1. 现有的Placement策略：
-   + 矩阵globalPosition (worldSize * expertsNum), 可以使用globalPos=[[1,4],[2,3],[3,4],[4,1]]表示
-     + globalPos[0]: 表示第一张GPU存放的experts参数
-   + All reduce时，根据矩阵信息进行all_reduce
-      + 不同rank之间的all_reduce算子如何保持正确&并行
-2. 建立expert-data-parallel-group
-   + 在`utils/groups.py/_create_expert_and_data_parallel`建立新的并行group
-   + 使用array数据结构
-3. All_to_All communication
-   + 确定发送与接受的数据量大小 (需要合并发送数据量&标记数组清零)
-   + 使用pytorch中`all2all_single_unequal_split`，发送all2all
-4. locally compute
-5. add all_reduce at end of each backward
-   + possible solution: pytorch hook?
-6. 达到特定轮次后，开启gurobi优化
-   + change experts placement
-   + change globalPostion array
 
 ### misc
 + `expert_parallel_size_`: 所有不同的experts（不考虑数据并行）占据了多少个GPUs
@@ -81,12 +57,34 @@
      + KEY: `_EXPERT_NAME`      : 当前保存的experts名称 (group name) 例如"layer_1_expert_13"
      + VALUE: `_PROCESS_GROUP`  ：process_group信息
 
-### pytest_case:
+4. 在group.py中维护dict`_DYNAMIC_CURRENT_EXPERT_PROPORTION`当前GPU上，每层中每个expert参与计算的tokens数目占全局的比重
+
+
+### Steps
+1. 现有的Placement策略：
+   + 矩阵globalPosition (worldSize * expertsNum), 可以使用globalPos=[[1,4],[2,3],[3,4],[4,1]]表示
+     + globalPos[0]: 表示第一张GPU存放的experts参数
+   + All reduce时，根据矩阵信息进行all_reduce
+      + 不同rank之间的all_reduce算子如何保持正确&并行
+2. 建立expert-data-parallel-group
+   + 在`utils/groups.py/_create_expert_and_data_parallel`建立新的并行group
+   + 使用array数据结构
+3. All_to_All communication
+   + 确定发送与接受的数据量大小 (需要合并发送数据量&标记数组清零)
+   + 使用pytorch中`all2all_single_unequal_split`，发送all2all
+4. locally compute
+5. add all_reduce at end of each backward
+   + possible solution: pytorch hook?
+6. 达到特定轮次后，开启gurobi优化
+   + change experts placement
+   + change globalPostion array
+
+
+### Testcase:
+should have 2 gpus
 ``` shell
-
-cd /research/d1/rshr/ytyang/DeepSpeed/tests/util/moe
-pytest test_model_broadcast.py
-
+cd moe-test
+./run.sh
 ```
 
 ## Todo
@@ -100,8 +98,11 @@ pytest test_model_broadcast.py
 
 ## Next Week
 - [x] 重写全局all2all与expert计算
-- [ ] add pytest for regression test
+- [x] 参数all_reduce时，按照fed-AVG处理
+- [x] add pytest for regression test
 - [ ] 在transformer-xl上实验dynamic placement (random)
 - [ ] all_reduce (SUM) 计算 experts tokens dispatch
 - [ ] 引入gurobi expert placement calculation
-- [ ] 参数all_reduce时，按照fed-AVG处理
+
+## Profile
+- [ ] deepspeed中现有的一些profile，例如RunningAvgSamplesPerSec, CurrSamplesPerSec

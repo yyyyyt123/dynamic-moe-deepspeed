@@ -193,9 +193,9 @@ def _create_dynamic_expert_parallel(placement, layer_idx, num_experts):
     
     _ensure_divisibility(world_size, placement.shape[0])
     
-    # Build the dynamic expert parallel groups.
+    # (current rank) the dynamic expert parallel groups.
     global _DYNAMIC_EXPERTS_PARALLEL_GROUP
-    
+    # (world) the global dynamic expert parallel groups.
     global _DYNAMIC_EXPERTS_PROCESS_GROUPS_DICT
     
     # example: placement->[[0,3],[1,2],[1,2],[0,3]] indicates gpu0 contains exp1&3
@@ -221,6 +221,7 @@ def _create_dynamic_expert_parallel(placement, layer_idx, num_experts):
         
         if rank in comm_group_ranks:
             exp_name = f"layer_{layer_idx}_expert_{i}"
+            # init current expert parallel group
             _DYNAMIC_EXPERTS_PARALLEL_GROUP[exp_name] = group
             comm_ranks_group=dist.get_rank(group)
             log_dist(
