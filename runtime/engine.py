@@ -2191,7 +2191,7 @@ class DeepSpeedEngine(Module):
         log_dist(f"step={step}, skipped={self.skipped_steps}, lr={lr}, mom={mom}",
                  ranks=[0])
 
-    def allreduce_bucket(self, bucket, dp_group):
+    def allreduce_bucket(self, bucket, dp_group, coefficient):
         tensor = self.flatten(bucket)
 
         tensor_to_allreduce = tensor
@@ -2210,7 +2210,12 @@ class DeepSpeedEngine(Module):
                     tensor_to_allreduce.mul_(self.gradient_predivide_factor() /
                                              dist.get_world_size(group=dp_group))
         else:
-            tensor_to_allreduce.mul_(1. / dist.get_world_size(group=dp_group))
+            # for dynamic placement, we should do fed-avg for gradidents
+            if coefficient == -1:
+                tensor_to_allreduce.mul_(1. / dist.get_world_size(group=dp_group))
+            else:
+                tensor_to_allreduce.mul_(coefficient)
+                
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
 
         if self.communication_data_type != tensor.dtype and tensor is not tensor_to_allreduce:
@@ -2218,23 +2223,23 @@ class DeepSpeedEngine(Module):
 
         return tensor
 
-    def allreduce_and_copy(self, small_bucket, dp_group):
-        allreduced = self.allreduce_bucket(small_bucket, dp_group)
+    def allreduce_and_copy(self, small_bucket, dp_group, coefficient):
+        allreduced = self.allreduce_bucket(small_bucket, dp_group, coefficient)
         for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
             buf.copy_(synced)
 
-    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000):
+    def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000, coefficient=-1):
         small_bucket = []
         numel = 0
         for tensor in bucket:
             small_bucket.append(tensor)
             numel = numel + tensor.numel()
             if numel > numel_per_bucket:
-                self.allreduce_and_copy(small_bucket, dp_group)
+                self.allreduce_and_copy(small_bucket, dp_group, coefficient)
                 small_bucket = []
                 numel = 0
         if len(small_bucket) > 0:
-            self.allreduce_and_copy(small_bucket, dp_group)
+            self.allreduce_and_copy(small_bucket, dp_group, coefficient)
 
     def _get_gradients_for_reduction(self):
         non_expert_grads = []
@@ -2313,6 +2318,8 @@ class DeepSpeedEngine(Module):
     def _reduce_dynamic_expert_gradients(self, expert_grads, elements_per_buffer):
         for ep_name, expert_grads_group in expert_grads.items():
             expert_split_buckets = split_half_float_double_sparse(expert_grads_group)
+            # get all-reduce coeffieient (fed-avg) 
+            _all_reduce_coefficient = topology._get_dynamic_experts_tokens_proportion(ep_name)
             for i, bucket_tuple in enumerate(expert_split_buckets):
                 bucket_type, bucket = bucket_tuple
                 if bucket_type == SparseTensor.type():
@@ -2324,7 +2331,9 @@ class DeepSpeedEngine(Module):
                     self.allreduce_no_retain(
                         bucket,
                         dp_group=groups._get_dynamic_expert_parallel_group(ep_name),
-                        numel_per_bucket=elements_per_buffer)
+                        numel_per_bucket=elements_per_buffer,
+                        coefficient = _all_reduce_coefficient)
+        topology._reset_dynamic_experts_tokens_proportion()
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         if grads is None:

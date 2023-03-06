@@ -207,7 +207,10 @@ class DynamicMoE(torch.nn.Module):
         sub_groups_start = (rank // self.intra_node_gpus) * self.intra_node_gpus
         sub_groups_end = sub_groups_start + self.intra_node_gpus
         self.current_intra_node_placement = self.placement[sub_groups_start:sub_groups_end].tolist()
+        # set processed tokens proportation
+        topology._init_dynamic_experts_tokens_proportion(self.current_experts_name)
         
+        # log info
         print(f"rank:{rank}'s placement is {self.placement}")
         
         log_dist(

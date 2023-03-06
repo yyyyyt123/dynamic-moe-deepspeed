@@ -909,7 +909,7 @@ class DynamicMOELayer(Base):
         self.ep_group_name = ep_group_name
         self.num_local_experts = num_local_experts # num_exp_replica + unique experts
         self.num_exp_replica = num_exp_replica
-        self.current_experts_indices = current_experts.tolist() # current experts indices
+        self.current_experts_placement = current_experts.tolist() # current experts (global number)
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
@@ -979,7 +979,8 @@ class DynamicMOELayer(Base):
         expert_outputs = _AllToAll_UNEQUAL.apply(group, flatten_results,
                                                 output_split,input_split)
         # expert_outputs.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, backward all2all expert_outputs:{expert_outputs.shape}"))
-        
+        topology._count_dynamic_experts_tokens_proportion(expert_name=self.experts.curr_name[expert_index],
+                                                        tokens_num=curr_expert_tokens.shape[0])
         for i, sync in enumerate(unflatten(expert_outputs, tokens)):
             # calc output placement index
             output_index = send_tokens_idx[i]
@@ -1004,7 +1005,7 @@ class DynamicMOELayer(Base):
                      d_model: int,
                      _current_capacity,
                      recv_experts_outputs: list,
-                     current_experts_indices: list,
+                     current_experts_placment: list,
                      num_local_unique_experts: int
                      ):
         """single round all2all communication and expert computation
@@ -1047,13 +1048,16 @@ class DynamicMOELayer(Base):
             # concatenate the tokens 
             _tokens_in_use = torch.cat(_tokens_2_experts, dim=0)
             # calc expert index in calculation
-            expert_index = current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i)
+            expert_index = current_experts_placment.index(dist.get_rank()*num_local_unique_experts + i)
             # expert calculate results
             _expert_output = self.experts(_tokens_in_use, expert_index)
             # split back
             expert_output_split = torch.split(_expert_output, split_size_or_sections = _size, dim=0)
             # put elements back in tensor list
             output_send_back[i::num_local_unique_experts] = expert_output_split
+            # log tokens in use (for fed-avg all_refuce)
+            topology._count_dynamic_experts_tokens_proportion(expert_name=self.experts.curr_name[expert_index],
+                                                        tokens_num=_tokens_in_use.shape[0])
         
         # output = self.experts(curr_expert_tokens, expert_index)
         # output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert {self.experts.curr_name[expert_index]} calc finish"))
@@ -1117,10 +1121,6 @@ class DynamicMOELayer(Base):
             dispatched_input = einsum("sec,sm->ecm", # (num of experts, capacity, dimension)
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)  # 8, 84
-            # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
-            # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
-            # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
-
             # print(f"DYNA: rank:{dist.get_rank()}, dispatched_input:{dispatched_input}")
             _current_capacity = dispatched_input.shape[1]
             chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
@@ -1132,10 +1132,13 @@ class DynamicMOELayer(Base):
             tokens = []
             for i, send in enumerate(curr_exp_counts):
                 # TODO: Try to optimize einsum calculation
+                # This is a rare situation
                 # set send == 1 can avoid backward propagation deadlock in world all2all communication
                 # if the tokens dispatch to a specified expert is 0, then backward computation in `single_round` function
                 # may suffer deadlock as the padding 0 block the chain rule of tensor autograder (block propagation)
-                if send==0: send = 1 
+                if send==0: 
+                    send = 1 
+                    curr_exp_counts[i] += 1
                 tokens.append(chunks[i].squeeze(dim=0)[0:send])
 
             # auxiliary variables for all2all communication and computation
@@ -1193,7 +1196,7 @@ class DynamicMOELayer(Base):
                 d_model=d_model,
                 _current_capacity=_current_capacity,
                 recv_experts_outputs=recv_experts_outputs,
-                current_experts_indices=self.current_experts_indices,
+                current_experts_placment=self.current_experts_placement,
                 num_local_unique_experts=num_local_unique_experts,
             )
             
@@ -1253,5 +1256,14 @@ class DynamicMOELayer(Base):
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
+        # count global experts tokens in use (for all_reduce)
+        curr_exp_tokens_use_counts = [min(w, _current_capacity) for w in curr_exp_counts]
+        curr_exp_tokens_use_counts_tensor = torch.tensor(curr_exp_tokens_use_counts, device=device, dtype=torch.int32)
+        dist.all_reduce(curr_exp_tokens_use_counts_tensor)
+        for i, p in enumerate(self.current_experts_placement):
+            _global_tokens_4_expert = curr_exp_tokens_use_counts_tensor[p].item()
+            _name = self.experts.curr_name[i]
+            topology._normalize_dynamic_experts_tokens_proportion(expert_name=_name,
+                                                                   total_tokens=_global_tokens_4_expert)
         return a
 

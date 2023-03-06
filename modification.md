@@ -9,7 +9,7 @@
 2. In `runtime/dataloader.py`: add `dataloader.set_spoch(epoch)` to shuffle the deepspeed trainloader. To disable shuffle, just use the fix number rather epoch `dataloader.set_spoch(0)` (`DeepSpeedDataLoader.set_epoch(...)`)
 
 
-
+### 2023/3/6
 老师我想来update一下最近的一些进展。前两周除了帮tanxin讨论讨论他的idea之外，还尝试去改了改deepspeed-moe的训练部分。现在已经完成了部分内容
 
 1. 目前正在实现dynamic placement的training优化，目前已经完成的工作：
@@ -24,3 +24,10 @@
 1. 先在transformer-xl模型上实验目前的训练框架，检查是否会出现训练或者模型收敛问题 （因为cifar10模型比较简单，且只有一层moe layer）
 2. 加入dynamic placement逻辑，动态变更GPU上experts模型参数
 3. 在多机多卡条件下，测量deepspeed训练框架更改前，更改后end-to-end training的具体性能提升数据，思考后续的优化目标
+
+### Fed-Avg
+
+1. 每轮开始时，all_reduce各个experts总计会收到的tokens数目
+2. 在计算过程中，维护每个experts (replica) 实际参与计算的tokens数目
+3. 在group.py中维护dict`_DYNAMIC_CURRENT_EXPERT_PROPORTION`当前GPU上，每层中每个expert参与计算的tokens数目占全局的比重
+4. 更改`runtime/engine.py/DeepSpeedEngine/_reduce_dynamic_expert_gradients`中对expert参数all_reduce的逻辑
