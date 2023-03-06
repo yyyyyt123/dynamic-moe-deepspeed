@@ -1138,10 +1138,11 @@ class DynamicMOELayer(Base):
                 if send==0: send = 1 
                 tokens.append(chunks[i].squeeze(dim=0)[0:send])
 
-            ''' first round: intra node '''
-            # {num_local_experts} round all2all
+            # auxiliary variables for all2all communication and computation
             _processed_idx=[]
             recv_experts_outputs = [[] for _ in range(dispatched_input.shape[0])]
+            # first intra node then inter node all2all 
+            ''' first round: intra node '''
             for i in range(self.num_local_experts):
                 send_tokens_idx = []
                 for j in range(topology._get_gpu_per_node_number()):
@@ -1164,7 +1165,6 @@ class DynamicMOELayer(Base):
                                   expert_index=i)
             
             ''' second round: inter node '''
-            # TODO: rewrite global communication, in case of global exchange tokens with size [0,0,0,0]
             num_local_unique_experts = self.num_local_experts - self.num_exp_replica
             send_tokens_idx = []
             global_token_send=[]
@@ -1196,39 +1196,7 @@ class DynamicMOELayer(Base):
                 current_experts_indices=self.current_experts_indices,
                 num_local_unique_experts=num_local_unique_experts,
             )
-                        # global_token_send.append(_send_empty)
-                        # global_input_split.append(0)
-                        # tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, inter-grad {grad.shape} finish"))
             
-            # original code
-            # num_local_unique_experts = self.num_local_experts - self.num_exp_replica
-            # for i in range(num_local_unique_experts):
-            #     send_tokens_idx = []
-            #     global_token_send=[]
-            #     global_input_split = []
-            #     for idx in range(i, dispatched_input.shape[0], num_local_unique_experts):
-            #         send_tokens_idx.append(idx)
-            #         if idx not in _processed_idx:
-            #             global_token_send.append(tokens[idx])
-            #             global_input_split.append(tokens[idx].numel())
-            #             _processed_idx.append(idx)
-            #             tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, inter-grad {grad.shape} finish"))
-                        
-            #         else:
-            #             _send_empty=torch.tensor([], dtype=dtype, device=device)
-            #             global_token_send.append(_send_empty)
-            #             global_input_split.append(0)
-
-            #     print(f"**** inter_all_to_all, input_split:{global_input_split} token send by expert{self.experts.curr_name[self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i)]} ****")
-            #     self.single_round(group=None,
-            #                 send_tokens_idx=send_tokens_idx,
-            #                 input_split=global_input_split,
-            #                 tokens=global_token_send,
-            #                 d_model=d_model,
-            #                 _current_capacity=_current_capacity,
-            #                 recv_experts_outputs=recv_experts_outputs,
-            #                 expert_index=self.current_experts_indices.index(dist.get_rank()*num_local_unique_experts + i))
-        
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
 

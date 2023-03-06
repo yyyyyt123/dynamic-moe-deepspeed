@@ -81,12 +81,11 @@
      + KEY: `_EXPERT_NAME`      : 当前保存的experts名称 (group name) 例如"layer_1_expert_13"
      + VALUE: `_PROCESS_GROUP`  ：process_group信息
 
-### pytest_case:
+### Testcase:
+should have 2 gpus
 ``` shell
-
-cd /research/d1/rshr/ytyang/DeepSpeed/tests/util/moe
-pytest test_model_broadcast.py
-
+cd moe-test
+./run.sh
 ```
 
 ## Todo
