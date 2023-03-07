@@ -25,7 +25,7 @@
 2. 加入dynamic placement逻辑，动态变更GPU上experts模型参数
 3. 在多机多卡条件下，测量deepspeed训练框架更改前，更改后end-to-end training的具体性能提升数据，思考后续的优化目标
 
-### Fed-Avg
+### weighted-all-reduce
 
 1. 每轮开始时，all_reduce各个experts总计会收到的tokens数目
 2. 在计算过程中，维护每个experts (replica) 实际参与计算的tokens数目
