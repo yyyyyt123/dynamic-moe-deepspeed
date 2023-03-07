@@ -211,11 +211,10 @@ class DynamicMoE(torch.nn.Module):
         topology._init_dynamic_experts_tokens_proportion(self.current_experts_name)
         
         # log info
-        print(f"rank:{rank}'s placement is {self.placement}")
+        print(f"rank:{rank} layer_{self.layer_idx} placement is {self.placement}")
         
         log_dist(
-            f'Creating DynamicMoE layer with total_experts: {num_experts} | num_local_experts: {self.num_local_experts} \
-            | number of replica: {self.num_exp_replica}| current_experts_replica:{self.current_experts_replica_idx}',
+            f'Creating DynamicMoE layer_{self.layer_idx} with total_experts: {num_experts} | num_local_experts: {self.num_local_experts} | number of replica: {self.num_exp_replica}| current_experts_replica:{self.current_experts_replica_idx}',
             [rank])
 
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
