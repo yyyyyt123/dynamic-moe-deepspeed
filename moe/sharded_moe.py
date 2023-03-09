@@ -217,7 +217,7 @@ def top1gating(logits: Tensor, # tokens after embedding
                used_token: Tensor = None,
                noisy_gate_policy: Optional[str] = None,
                drop_tokens: bool = True,
-               use_rts: bool = True,
+               use_rts: bool = False,
                use_tutel: bool = False) -> Tuple[Tensor,
                                                  Tensor,
                                                  Tensor,
@@ -604,7 +604,7 @@ class TopKGate(Module):
                  min_capacity: int = 8,
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts: bool = True,
+                 use_rts: bool = False,
                  dyna_threshold: float = 0.075) -> None:
         super().__init__()
 
@@ -900,6 +900,7 @@ class DynamicMOELayer(Base):
                  num_exp_replica: int,
                  current_experts,
                  current_intra_node_placement,
+                 intra_round_split: bool = False,
                  use_tutel: bool = False) -> None:
         super().__init__()
         self.gate = gate
@@ -910,13 +911,13 @@ class DynamicMOELayer(Base):
         self.num_local_experts = num_local_experts # num_exp_replica + unique experts
         self.num_exp_replica = num_exp_replica
         self.current_experts_placement = current_experts.tolist() # current experts (global number)
-        self.time_falltoall = 0.0
-        self.time_salltoall = 0.0
+        self.time_intra_round = 0.0
+        self.time_inter_round = 0.0
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
         self.current_intra_node_placement=current_intra_node_placement # current intra-node placement info
-
+        self.intra_round_split = intra_round_split
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
         if self.use_tutel:
@@ -1048,14 +1049,16 @@ class DynamicMOELayer(Base):
             # concatenate the tokens 
             _tokens_in_use = torch.cat(_tokens_2_experts, dim=0)
             # calc expert index in calculation
-            expert_index = current_experts_placment.index(dist.get_rank()*num_local_unique_experts + i)
+            # if group is None, then we are in inter round (computing global all2all)
+            # else we are in intra round
+            expert_index = i if group is not None else current_experts_placment.index(dist.get_rank()*num_local_unique_experts + i)
             # expert calculate results
             _expert_output = self.experts(_tokens_in_use, expert_index)
             # split back
             expert_output_split = torch.split(_expert_output, split_size_or_sections = _size, dim=0)
             # put elements back in tensor list
             output_send_back[i::num_local_unique_experts] = expert_output_split
-            # log tokens in use (for fed-avg all_refuce)
+            # log tokens in use (for fed-avg all_reduce)
             topology._count_dynamic_experts_tokens_proportion(expert_name=self.experts.curr_name[expert_index],
                                                         tokens_num=_tokens_in_use.shape[0])
         
@@ -1144,64 +1147,102 @@ class DynamicMOELayer(Base):
             # auxiliary variables for all2all communication and computation
             _processed_idx=[]
             recv_experts_outputs = [[] for _ in range(dispatched_input.shape[0])]
-            # first intra node then inter node all2all 
+            
             ''' first round: intra node '''
-            for i in range(self.num_local_experts):
+            # (intra round) first intra node then inter node all2all 
+            if self.wall_clock_breakdown:
+                self.timers('intra_round').start()
+            # (intra round) if enable split intra round, do {num_local_exp} rounds comm and comp
+            if self.intra_round_split:
+                # TODO: pipeline and overlap comm and comp
+                for i in range(self.num_local_experts):
+                    send_tokens_idx = []
+                    for j in range(topology._get_gpu_per_node_number()):
+                        send_tokens_idx.append(self.current_intra_node_placement[j][i])
+                    _processed_idx.extend(send_tokens_idx)
+                    
+                    token_send=[]
+                    input_split=[]
+                    for idx in send_tokens_idx:
+                        token_send.append(tokens[idx])
+                        # tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, intra-grad {grad.shape} calc finish"))
+                        input_split.append(tokens[idx].numel())
+                    self.single_round(group=intra_comm_group,
+                                    send_tokens_idx=send_tokens_idx,
+                                    input_split=input_split,
+                                    tokens=token_send,
+                                    d_model=d_model,
+                                    _current_capacity=_current_capacity,
+                                    recv_experts_outputs=recv_experts_outputs,
+                                    expert_index=i)
+            else:
+            # (intra round) else combine all tokens and do one single intra round comm & comp
                 send_tokens_idx = []
-                for j in range(topology._get_gpu_per_node_number()):
-                    send_tokens_idx.append(self.current_intra_node_placement[j][i])
-                _processed_idx.extend(send_tokens_idx)
-                
                 token_send=[]
                 input_split=[]
+                for j in range(topology._get_gpu_per_node_number()):
+                    for i in range(self.num_local_experts):
+                        send_tokens_idx.append(self.current_intra_node_placement[j][i])
+                        _processed_idx.append(self.current_intra_node_placement[j][i])
+                    
                 for idx in send_tokens_idx:
                     token_send.append(tokens[idx])
-                    # tokens[idx].register_hook(lambda grad: print(f"rank:{dist.get_rank()}, index:{idx}, intra-grad {grad.shape} calc finish"))
                     input_split.append(tokens[idx].numel())
-                self.single_round(group=intra_comm_group,
-                                  send_tokens_idx=send_tokens_idx,
-                                  input_split=input_split,
-                                  tokens=token_send,
-                                  d_model=d_model,
-                                  _current_capacity=_current_capacity,
-                                  recv_experts_outputs=recv_experts_outputs,
-                                  expert_index=i)
+                
+                self.inter_round(group=intra_comm_group,
+                                 send_tokens_idx=send_tokens_idx,
+                                 input_split=input_split,
+                                 tokens=token_send,
+                                 d_model=d_model,
+                                 _current_capacity=_current_capacity,
+                                 recv_experts_outputs=recv_experts_outputs,
+                                 current_experts_placment=self.current_experts_placement,
+                                 num_local_unique_experts=self.num_local_experts)
+            # (intra round) log intra_all2all and comp time
+            if self.wall_clock_breakdown:
+                self.timers('intra_round').stop()
+                self.time_intra_round = self.timers('intra_round').elapsed(reset=False)
             
             ''' second round: inter node '''
-            num_local_unique_experts = self.num_local_experts - self.num_exp_replica
-            send_tokens_idx = []
-            global_token_send=[]
-            global_token_send_split=[]
-            for i in range(dist.get_world_size()):
-                _tokens_global=[]
-                _tokens_global_size=[]
-                for idx in range(i * num_local_unique_experts, (i+1) * num_local_unique_experts):
-                    send_tokens_idx.append(idx)
-                    if idx not in _processed_idx:
-                        _tokens_global.append(tokens[idx])
-                        _tokens_global_size.append(tokens[idx].numel())
-                        # global_input_split.append(tokens[idx].numel())
-                        _processed_idx.append(idx)
-                    else:
-                        _send_empty=torch.tensor([], dtype=dtype, device=device)
-                        _tokens_global.append(_send_empty)
-                        _tokens_global_size.append(0)
-                global_token_send.extend(_tokens_global)
-                global_token_send_split.extend(_tokens_global_size)
+            # (inter round) if intra-node all2all can not process all tokens, then inter-node round should be avtivated
+            if len(_processed_idx) != dispatched_input.shape[0]:
+                if self.wall_clock_breakdown:
+                    self.timers('inter_round').start()
+                num_local_unique_experts = self.num_local_experts - self.num_exp_replica
+                send_tokens_idx = []
+                global_token_send=[]
+                global_token_send_split=[]
+                for i in range(dist.get_world_size()):
+                    _tokens_global=[]
+                    _tokens_global_size=[]
+                    for idx in range(i * num_local_unique_experts, (i+1) * num_local_unique_experts):
+                        send_tokens_idx.append(idx)
+                        if idx not in _processed_idx:
+                            _tokens_global.append(tokens[idx])
+                            _tokens_global_size.append(tokens[idx].numel())
+                            # global_input_split.append(tokens[idx].numel())
+                            _processed_idx.append(idx)
+                        else:
+                            _send_empty=torch.tensor([], dtype=dtype, device=device)
+                            _tokens_global.append(_send_empty)
+                            _tokens_global_size.append(0)
+                    global_token_send.extend(_tokens_global)
+                    global_token_send_split.extend(_tokens_global_size)
 
-            self.inter_round(group=None,
-                send_tokens_idx=send_tokens_idx,
-                input_split=global_token_send_split,
-                tokens=global_token_send,
-                d_model=d_model,
-                _current_capacity=_current_capacity,
-                recv_experts_outputs=recv_experts_outputs,
-                current_experts_placment=self.current_experts_placement,
-                num_local_unique_experts=num_local_unique_experts,
-            )
-            
-        if self.wall_clock_breakdown:
-            self.timers('falltoall').start()
+                self.inter_round(group=None,
+                    send_tokens_idx=send_tokens_idx,
+                    input_split=global_token_send_split,
+                    tokens=global_token_send,
+                    d_model=d_model,
+                    _current_capacity=_current_capacity,
+                    recv_experts_outputs=recv_experts_outputs,
+                    current_experts_placment=self.current_experts_placement,
+                    num_local_unique_experts=num_local_unique_experts,
+                )
+                # (inter round) log inter-node all2all and comp time
+                if self.wall_clock_breakdown:
+                    self.timers('inter_round').stop()
+                    self.time_inter_round = self.timers('inter_round').elapsed(reset=False)
 
         if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
@@ -1211,19 +1252,6 @@ class DynamicMOELayer(Base):
             # this also doubles up as a communication optimization as we are
             # reducing the all-to-all communication volume.
             dispatched_input = drop_tokens(dispatched_input, dim=1)
-            # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
-            # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
-            
-        if self.wall_clock_breakdown:
-            self.timers('falltoall').stop()
-            self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
-
-        if self.wall_clock_breakdown:
-            self.timers('salltoall').start()
-
-        if self.wall_clock_breakdown:
-            self.timers('salltoall').stop()
-            self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
 
         # Re-shape back: gecm -> ecm        
         # print(f"DYNA: rank:{dist.get_rank()}, recv_experts_outputs:{recv_experts_outputs}")
@@ -1232,7 +1260,6 @@ class DynamicMOELayer(Base):
                                               -1,
                                               d_model)
         # expert_output.register_hook(lambda grad: print(f"rank:{dist.get_rank()}, expert_output grad {grad.shape} calc finish"))
-        
         
         if groups._get_expert_model_parallel_world_size() == 1:
             # the dropped duplicate tokens need to be gathered on each
@@ -1247,9 +1274,7 @@ class DynamicMOELayer(Base):
                                      combine_weights.type_as(input[0]),
                                      expert_output)
 
-        # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
         a = combined_output.reshape(input[0].shape)
-        # logger.debug("a.shape({}), a:{}".format(a.shape, a))
         # print(f"DYNA: rank:{dist.get_rank()}, weighted_sum:{a}")
 
         if self.wall_clock_breakdown:

@@ -1,5 +1,7 @@
 #!/bin/bash
-
+###################
+# we should trun off rts in top1 gating
+###################
 # Number of nodes
 NUM_NODES=1
 # Number of GPUs per node
