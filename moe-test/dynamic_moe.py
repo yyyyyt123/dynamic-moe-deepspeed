@@ -189,9 +189,9 @@ for n, batch in enumerate(data_loader):
     dist.barrier()
     loss_raw = model_raw(batch[0], batch[1])
     dist.barrier()
+    print(f"rank:{dist.get_rank()}, loss_dyn:{loss_dyn}, loss_raw:{loss_raw}")
     assert loss_dyn == loss_raw
     
-    print(f"rank:{dist.get_rank()}, loss_dyn:{loss_dyn}, loss_raw:{loss_raw}")
     model_dyn.backward(loss_dyn)
     model_raw.backward(loss_raw)
     model_dyn.step()
