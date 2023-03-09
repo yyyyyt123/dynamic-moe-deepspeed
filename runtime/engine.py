@@ -71,7 +71,7 @@ from .pipe.module import PipelineModule
 from .utils import ensure_directory_exists, get_ma_status
 from ..ops.op_builder import UtilsBuilder
 from ..ops.adam import FusedAdam
-from ..moe.sharded_moe import TopKGate, MOELayer
+from ..moe.sharded_moe import TopKGate, MOELayer, DynamicMOELayer
 from ..moe.layer import MoE, DynamicMoE
 from ..moe.utils import is_moe_param
 from ..git_version_info import version
@@ -1082,6 +1082,11 @@ class DeepSpeedEngine(Module):
                     self.moe_layers.append(module)
                     if self.wall_clock_breakdown():
                         module.wall_clock_breakdown = True
+                if isinstance(module, DynamicMOELayer):
+                    self.moe_layers.append(module)
+                    if self.wall_clock_breakdown():
+                        module.wall_clock_breakdown = True
+                
 
         # Pass the mpu from here to groups. For subsequent use, just query groups
         if self.mpu is not None:
@@ -1729,24 +1734,39 @@ class DeepSpeedEngine(Module):
         moe_time = 0.0
         falltoall = 0.0
         salltoall = 0.0
+        
+        intra_round=0.0
+        inter_round=0.0
+        
+        _layer_type=None
 
         for gate in self.gate_modules:
             #logger.info(f"Individual TopK gate time: {gate.gate_time:.2f} ms")
             gate_time += gate.gate_time
 
         for l in self.moe_layers:
-            #logger.info(f"MoE layer; total: {l.time_moe:.2f} ms, first alltoall: {l.time_falltoall:.2f}, second alltoall: {l.time_salltoall:.2f}")
             moe_time += l.time_moe
-            falltoall += l.time_falltoall
-            salltoall += l.time_salltoall
-
+            if isinstance(l, MOELayer):
+                #logger.info(f"MoE layer; total: {l.time_moe:.2f} ms, first alltoall: {l.time_falltoall:.2f}, second alltoall: {l.time_salltoall:.2f}")
+                falltoall += l.time_falltoall
+                salltoall += l.time_salltoall
+                _layer_type=1
+            elif isinstance(l, DynamicMOELayer):
+                intra_round += l.time_intra_round
+                inter_round += l.time_inter_round
+                _layer_type=2
         # TODO: Allreduce/average them across ranks for more accurate timing.
 
         # if deepspeed.comm.get_rank() == 0:
         # TODO: fix moe_layer printing
-        log_dist(
-            f"rank={dist.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
-            ranks=[0])
+        if _layer_type == 1:
+            log_dist(
+                f"rank={dist.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
+                ranks=[0])
+        elif _layer_type == 2:
+            log_dist(
+                f"rank={dist.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, intra_round {intra_round:.2f}, inter_rounf: {inter_round:.2f}, top-k: {gate_time:.2f})",
+                ranks=[0])
 
     @instrument_w_nvtx
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):

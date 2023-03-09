@@ -27,7 +27,7 @@ class MoE(torch.nn.Module):
                  use_residual=False,
                  noisy_gate_policy: typing.Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts=False,
+                 use_rts=True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
                  dyna_threshold: float = 0.015):
@@ -153,7 +153,7 @@ class DynamicMoE(torch.nn.Module):
                  use_residual=False,
                  noisy_gate_policy: typing.Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts=False,
+                 use_rts=True,
                  use_tutel: bool = False,
                  dyna_threshold: float = 0.015,
                  num_exp_replica=1
